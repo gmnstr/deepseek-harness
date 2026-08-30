@@ -23,6 +23,7 @@ import type {
   DerivedActivity,
   DerivedAuthority,
   DerivedEffect,
+  DerivedEffectOutcome,
   DerivedExecution,
   DerivedSessionState,
 } from './types.ts'
@@ -44,13 +45,22 @@ function canonicalEventBytes(event: SessionEvent): string {
 
 /**
  * Build the fold's working execution map for a session log. `execution/
- * commanded` opens an execution; when the stream of `execution/commanded`
- * events for the same execution ends (the event order settles it), the
- * execution is marked settled. Settlement is DERIVED, never logged.
+ * commanded` opens an execution. Settlement is DERIVED, never logged: an
+ * execution is settled when every effect it requested reached a terminal
+ * derived outcome (`succeeded` / `failed` / `reconciled` / `denied`). An
+ * execution with a pending or ambiguous effect (`requested` / `authorized` /
+ * `attempt-started` / `commit-unknown`) is NOT settled — the fold never
+ * conflates "the log happens to end here" with "the execution reached a
+ * terminal state." An execution that requested no effects is settled by
+ * construction.
  * @param events - the contiguous log in seq order.
+ * @param effects - the derived effect map (needed to test effect terminals).
  * @returns the derived execution map keyed by execution id.
  */
-function foldExecutions(events: readonly SessionEvent[]): ReadonlyMap<ExecutionId, DerivedExecution> {
+function foldExecutions(
+  events: readonly SessionEvent[],
+  effects: ReadonlyMap<ActionId, DerivedEffect>,
+): ReadonlyMap<ExecutionId, DerivedExecution> {
   const executions = new Map<ExecutionId, DerivedExecution>()
   const nativeByExecution = new Map<ExecutionId, number[]>()
   for (const event of events) {
@@ -70,14 +80,17 @@ function foldExecutions(events: readonly SessionEvent[]): ReadonlyMap<ExecutionI
       nativeByExecution.set(payload.execution_id, seqs)
     }
   }
-  // Settlement rule: an execution is settled when its `execution/commanded`
-  // stream has ended — mirroring P0's derived-settlement rule. There is no
-  // `execution/settled` control event; the fold derives it from the log.
+  const terminal = new Set<DerivedEffectOutcome>(['succeeded', 'failed', 'reconciled', 'denied'])
   const result = new Map<ExecutionId, DerivedExecution>()
   for (const [id, execution] of executions) {
+    // Every effect requested by THIS execution must have reached a terminal
+    // outcome. Effects owned by other executions never affect it; an execution
+    // with no effects is trivially settled.
+    const ownedEffects = [...effects.values()].filter(effect => effect.execution_id === id)
+    const settled = ownedEffects.every(effect => terminal.has(effect.outcome))
     result.set(id, {
       ...execution,
-      settled: true,
+      settled,
       native_event_seqs: nativeByExecution.get(id) ?? [],
     })
   }
@@ -227,9 +240,9 @@ function foldEffects(
  * @returns the derived read model with its digest.
  */
 export function foldProjection(events: readonly SessionEvent[], sessionId: string): DerivedSessionState {
-  const executions = foldExecutions(events)
-  const activities = foldActivities(events)
   const { authorities, effects } = foldEffects(events)
+  const executions = foldExecutions(events, effects)
+  const activities = foldActivities(events)
   const digest = createHash('sha256')
   for (const event of events) digest.update(canonicalEventBytes(event))
   return {

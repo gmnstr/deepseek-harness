@@ -131,7 +131,8 @@ await runtime.beginExecution(ExecutionId('exec-1'), 'git status', 'surface')
 - **派生投影，不是第二权威。** 此包概念上取代的 SQLite 投影是可丢弃的：删除它并从 DSH 日志重建。DSH 日志是唯一持久的真相；在此包范围内，运行时本身不写任何 SQLite 行。
 - **真实外部效果的对账协议延后（P4+）。** `reconcile()` 通过带 `reconcile: true` 的 worker 解决先前的 `commit-unknown`；生产级对账协议（外部状态检查、幂等键、saga 补偿）不在此范围内。
 - **派生的 outbox 是工作视图，不是持久的。** `EffectExecutor.outbox()` 在调用时折叠 DSH 日志；它是调度恢复点，绝不是真相来源。
-- **没有超出 A1 词汇的生命周期事件。** `execution/commanded` 的结算被 DERIVED（当其命令流结束时，折叠将该执行标记为已结算）；词汇中没有 `execution/settled` 事件。
+- **没有超出 A1 词汇的生命周期事件。** 没有 `execution/settled` 事件。结算从规范终态事实 DERIVED（派生）：当该执行请求的每个效应都达到终态派生结果（`succeeded` / `failed` / `reconciled` / `denied`）时，该执行被视为已结算；带有挂起或模糊（`commit-unknown`）效应的执行 NOT 结算；未请求任何效应的执行按构造即已结算。折叠从不把「日志恰好在此结束」当作终态信号。
+- **实时原生会话被排除在运行时拥有的会话之外。** 运行时仅通过 `appendFenced` 写入；实时 `Session` 的写回路径未加栅栏。在同一个后端中，绑定到运行时已栅栏实体化会话的实时 `Session` 会被拒绝（种子不匹配的 id 冲突），因此两种写入模式不能共同拥有同一个会话 id。任何确实写入的未加栅栏写入仍会被派生折叠观察到（digest/last-seq 变化），因此第二权威写入无法静默损坏派生状态。
 
 <a id="dev-note"></a>
 ### 开发者备注
