@@ -34,7 +34,8 @@ const ATTEMPT = AttemptId('attempt-1')
 /**
  * A full representative history: execution commanded → activity correlated →
  * effect requested → authorized → attempt-started → commit-unknown →
- * reconciled → second execution commanded (settled stream ends).
+ * reconcile-probe attempt-started → reconciled → second execution commanded
+ * (settled stream ends).
  */
 function fullHistory(): SessionEvent[] {
   const fixtures: Array<{ type: string; data: Record<string, unknown> }> = [
@@ -44,6 +45,7 @@ function fullHistory(): SessionEvent[] {
     { type: 'effect/authorized', data: effectAuthorized({ execution_id: EXECUTION, action_id: ACTION, capability_id: 'fs.write' }) },
     { type: 'effect/attempt-started', data: effectAttemptStarted({ execution_id: EXECUTION, action_id: ACTION, attempt_id: ATTEMPT }) },
     { type: 'effect/commit-unknown', data: effectCommitUnknown({ execution_id: EXECUTION, action_id: ACTION, attempt_id: ATTEMPT }) },
+    { type: 'effect/attempt-started', data: effectAttemptStarted({ execution_id: EXECUTION, action_id: ACTION, attempt_id: AttemptId('act-1:reconcile:1') }) },
     { type: 'effect/reconciled', data: effectReconciled({ execution_id: EXECUTION, action_id: ACTION, attempt_id: AttemptId('act-1:reconcile:1'), receipt: { ok: true } }) },
     { type: 'execution/commanded', data: executionCommanded({ execution_id: ExecutionId('exec-2'), command: 'ls', source: 'hook' }) },
   ]
@@ -81,8 +83,8 @@ describe('foldProjection', () => {
     const effect = state.effects.get(ACTION)
     expect(effect?.outcome).toBe('reconciled')
     expect(effect?.operation).toBe('write')
-    // attempt-started appends the dispatch attempt; the reconciled event
-    // appends the distinct reconcile attempt.
+    // The dispatch attempt and the reconcile-probe attempt are both appended
+    // by their respective attempt-started events.
     expect(effect?.attempt_ids).toEqual([ATTEMPT, AttemptId('act-1:reconcile:1')])
     expect(effect?.receipt).toEqual({ ok: true })
 

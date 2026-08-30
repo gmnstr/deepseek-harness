@@ -60,6 +60,7 @@ function representativeHistory(): SessionEvent[] {
     { type: 'effect/authorized', data: effectAuthorized({ execution_id: EXECUTION, action_id: ActionId('act-2'), capability_id: 'fs.patch' }) },
     { type: 'effect/attempt-started', data: effectAttemptStarted({ execution_id: EXECUTION, action_id: ActionId('act-2'), attempt_id: AttemptId('act-2:1') }) },
     { type: 'effect/commit-unknown', data: effectCommitUnknown({ execution_id: EXECUTION, action_id: ActionId('act-2'), attempt_id: AttemptId('act-2:1') }) },
+    { type: 'effect/attempt-started', data: effectAttemptStarted({ execution_id: EXECUTION, action_id: ActionId('act-2'), attempt_id: AttemptId('act-2:reconcile:1') }) },
     { type: 'effect/reconciled', data: effectReconciled({ execution_id: EXECUTION, action_id: ActionId('act-2'), attempt_id: AttemptId('act-2:reconcile:1'), receipt: { reconciled: true } }) },
     { type: 'execution/commanded', data: executionCommanded({ execution_id: ExecutionId('exec-2'), command: 'verify', source: 'hook' }) },
   ]

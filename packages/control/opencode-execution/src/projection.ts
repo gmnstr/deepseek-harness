@@ -169,13 +169,21 @@ function foldEffects(
         const payload = event.data as SessionEventMap['effect/attempt-started']
         update(payload.action_id, current => {
           if (current === undefined) return current
-          // `commit-unknown` is sticky: an ambiguous irreversible effect awaits
-          // reconciliation, so a reconcile probe's attempt-started must not
-          // hide that the action is still unresolved. Terminal outcomes are
-          // never regressed either.
-          if (current.outcome === 'succeeded' || current.outcome === 'reconciled'
-            || current.outcome === 'commit-unknown') return current
-          return { ...current, outcome: 'attempt-started', attempt_ids: [...current.attempt_ids, payload.attempt_id] }
+          // `commit-unknown` is sticky for the OUTCOME: an ambiguous
+          // irreversible effect awaits reconciliation, so a reconcile probe's
+          // attempt-started must not regress the outcome back to
+          // 'attempt-started'. Terminal outcomes (succeeded/reconciled) are
+          // never regressed either. But the attempt identity is ALWAYS
+          // appended: a reconcile probe's attempt-started (e.g.
+          // `act:1:reconcile:1`) is a canonical fact that later terminal
+          // events (failEffect/succeedEffect/commitUnknown) reference via
+          // requireAttemptStarted.
+          const outcome = current.outcome === 'succeeded' || current.outcome === 'reconciled'
+            ? current.outcome
+            : current.outcome === 'commit-unknown'
+              ? 'commit-unknown'
+              : 'attempt-started'
+          return { ...current, outcome, attempt_ids: [...current.attempt_ids, payload.attempt_id] }
         })
         break
       }
@@ -196,7 +204,10 @@ function foldEffects(
       }
       case 'effect/reconciled': {
         const payload = event.data as SessionEventMap['effect/reconciled']
-        update(payload.action_id, current => current === undefined ? current : { ...current, outcome: 'reconciled', attempt_ids: [...current.attempt_ids, payload.attempt_id], receipt: payload.receipt })
+        // The reconcile probe's attempt-started already appended the attempt id
+        // (see `effect/attempt-started`); this terminal event only resolves the
+        // outcome. Not appending here avoids recording the same attempt twice.
+        update(payload.action_id, current => current === undefined ? current : { ...current, outcome: 'reconciled', receipt: payload.receipt })
         break
       }
       default:
