@@ -16,6 +16,7 @@
  * consumer exists.
  */
 export const KNOWN_SESSION_EVENT_TYPES: ReadonlySet<string> = new Set([
+  'activity/correlated',
   'agent-preset/selected',
   'agent/inbox/spliced',
   'approval/asked',
@@ -29,6 +30,15 @@ export const KNOWN_SESSION_EVENT_TYPES: ReadonlySet<string> = new Set([
   'compaction/prune',
   'compaction/start',
   'compaction/summary',
+  'effect/attempt-started',
+  'effect/authorized',
+  'effect/commit-unknown',
+  'effect/denied',
+  'effect/failed',
+  'effect/reconciled',
+  'effect/requested',
+  'effect/succeeded',
+  'execution/commanded',
   'feedback/record',
   'goal/change',
   'hook/invoked',

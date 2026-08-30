@@ -360,6 +360,8 @@
       "@deepseek-ai/dsh-message-feedback/invariant": ["./packages/feedback/message-feedback/src/invariant.ts"],
       "@deepseek-ai/dsh-native-command": ["./packages/util/native-command/src"],
       "@deepseek-ai/dsh-native-command/invariant": ["./packages/util/native-command/src/invariant.ts"],
+      "@deepseek-ai/dsh-opencode-control": ["./packages/control/opencode-control/src"],
+      "@deepseek-ai/dsh-opencode-control/invariant": ["./packages/control/opencode-control/src/invariant.ts"],
       "@deepseek-ai/dsh-output-retention": ["./packages/util/output-retention/src"],
       "@deepseek-ai/dsh-output-retention/invariant": ["./packages/util/output-retention/src/invariant.ts"],
       "@deepseek-ai/dsh-permission-presets": ["./packages/interaction/permission-presets/src"],

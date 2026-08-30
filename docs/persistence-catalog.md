@@ -83,6 +83,29 @@ Sources: [`packages/core/session/src/types.ts:328`](../packages/core/session/src
 
 ## Events
 
+### `activity/*`
+
+<a id="activitycorrelated--log-only"></a>
+
+#### `activity/correlated` — log-only
+
+```ts persistence-catalog
+/**
+ * A native (non-harness) activity event was correlated to an execution:
+ * the control surface observed a native event sequence number under an
+ * execution id and tagged it with a kind so a consumer can reconstruct
+ * the native stream in order. Log-only; never part of derived history.
+ */
+'activity/correlated': {
+  version: 1
+  execution_id: ExecutionId
+  native_event_seq: number
+  kind: string
+}
+```
+
+Source: [`packages/control/opencode-control/src/types.ts:85`](../packages/control/opencode-control/src/types.ts)
+
 ### `agent/*`
 
 <a id="agentinboxspliced--log-only"></a>
@@ -381,6 +404,199 @@ Source: [`packages/compaction/compaction/src/types.ts:23`](../packages/compactio
 Types: [ContentBlock](subsystems/core.md) · [TokenUsage](subsystems/llm-streaming.md)
 
 Source: [`packages/compaction/compaction/src/types.ts:33`](../packages/compaction/compaction/src/types.ts)
+
+### `effect/*`
+
+<a id="effectattempt-started--log-only"></a>
+
+#### `effect/attempt-started` — log-only
+
+```ts persistence-catalog
+/**
+ * Execution of an authorized effect began as attempt `attempt_id` — the
+ * transition from decision to action. Exactly one per attempt; the
+ * attempt then reaches one of the terminal outcome events.
+ */
+'effect/attempt-started': {
+  version: 1
+  execution_id: ExecutionId
+  action_id: ActionId
+  attempt_id: AttemptId
+}
+```
+
+Source: [`packages/control/opencode-control/src/types.ts:134`](../packages/control/opencode-control/src/types.ts)
+
+<a id="effectauthorized--log-only"></a>
+
+#### `effect/authorized` — log-only
+
+```ts persistence-catalog
+/**
+ * An authority granted the requested effect: the capability id that
+ * authorized the action. Pairs with the prior `effect/requested` of the
+ * same `action_id`; an attempt may then start.
+ */
+'effect/authorized': {
+  version: 1
+  execution_id: ExecutionId
+  action_id: ActionId
+  capability_id: string
+}
+```
+
+Source: [`packages/control/opencode-control/src/types.ts:112`](../packages/control/opencode-control/src/types.ts)
+
+<a id="effectcommit-unknown--log-only"></a>
+
+#### `effect/commit-unknown` — log-only
+
+```ts persistence-catalog
+/**
+ * The attempt's outcome is unknown at recording time — the executor
+ * disconnected or lost the result (process killed, transport dropped).
+ * A later `effect/reconciled` (same attempt) may resolve the ambiguity.
+ */
+'effect/commit-unknown': {
+  version: 1
+  execution_id: ExecutionId
+  action_id: ActionId
+  attempt_id: AttemptId
+}
+```
+
+Source: [`packages/control/opencode-control/src/types.ts:169`](../packages/control/opencode-control/src/types.ts)
+
+<a id="effectdenied--log-only"></a>
+
+#### `effect/denied` — log-only
+
+```ts persistence-catalog
+/**
+ * An authority refused the requested effect — the durable denial record.
+ * `reason` is the authority's human-readable refusal, which stays
+ * reproducible on replay without re-asking the authority.
+ */
+'effect/denied': {
+  version: 1
+  execution_id: ExecutionId
+  action_id: ActionId
+  reason: string
+}
+```
+
+Source: [`packages/control/opencode-control/src/types.ts:123`](../packages/control/opencode-control/src/types.ts)
+
+<a id="effectfailed--log-only"></a>
+
+#### `effect/failed` — log-only
+
+```ts persistence-catalog
+/**
+ * The attempt failed. `error` is the stable machine-readable failure
+ * string, kept in the log so replay can reproduce the failure without
+ * re-executing the effect.
+ */
+'effect/failed': {
+  version: 1
+  execution_id: ExecutionId
+  action_id: ActionId
+  attempt_id: AttemptId
+  error: string
+}
+```
+
+Source: [`packages/control/opencode-control/src/types.ts:157`](../packages/control/opencode-control/src/types.ts)
+
+<a id="effectreconciled--log-only"></a>
+
+#### `effect/reconciled` — log-only
+
+```ts persistence-catalog
+/**
+ * An earlier `effect/commit-unknown` attempt was reconciled to a definite
+ * outcome after the fact: `receipt` carries the recovered outcome payload,
+ * so the log converges to one terminal fact per attempt.
+ */
+'effect/reconciled': {
+  version: 1
+  execution_id: ExecutionId
+  action_id: ActionId
+  attempt_id: AttemptId
+  receipt: unknown
+}
+```
+
+Source: [`packages/control/opencode-control/src/types.ts:180`](../packages/control/opencode-control/src/types.ts)
+
+<a id="effectrequested--log-only"></a>
+
+#### `effect/requested` — log-only
+
+```ts persistence-catalog
+/**
+ * An effect on a resource was requested — the earliest point the control
+ * plane records intent to mutate. `operation` names the mutation (create,
+ * write, execute, delete), `resource` the addressed path/name, and
+ * `effect_class` the authority class that must decide it (approval,
+ * sandbox, filesystem policy). A matching `effect/authorized` or
+ * `effect/denied` always follows.
+ */
+'effect/requested': {
+  version: 1
+  execution_id: ExecutionId
+  action_id: ActionId
+  operation: string
+  resource: string
+  effect_class: string
+}
+```
+
+Source: [`packages/control/opencode-control/src/types.ts:99`](../packages/control/opencode-control/src/types.ts)
+
+<a id="effectsucceeded--log-only"></a>
+
+#### `effect/succeeded` — log-only
+
+```ts persistence-catalog
+/**
+ * The attempt completed successfully. `receipt` is the opaque outcome
+ * payload the effect produced (result value, written path, exit code
+ * envelope); the producer owns its JSON shape.
+ */
+'effect/succeeded': {
+  version: 1
+  execution_id: ExecutionId
+  action_id: ActionId
+  attempt_id: AttemptId
+  receipt: unknown
+}
+```
+
+Source: [`packages/control/opencode-control/src/types.ts:145`](../packages/control/opencode-control/src/types.ts)
+
+### `execution/*`
+
+<a id="executioncommanded--log-only"></a>
+
+#### `execution/commanded` — log-only
+
+```ts persistence-catalog
+/**
+ * An execution unit was commanded by the control surface — the durable
+ * record that a command string was issued under an execution id, and the
+ * source (surface, automation, hook) that commanded it. `source` tells
+ * the command's provenance apart from ordinary model-visible tool calls.
+ */
+'execution/commanded': {
+  version: 1
+  execution_id: ExecutionId
+  command: string
+  source: string
+}
+```
+
+Source: [`packages/control/opencode-control/src/types.ts:73`](../packages/control/opencode-control/src/types.ts)
 
 ### `feedback/*`
 
