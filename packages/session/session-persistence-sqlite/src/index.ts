@@ -119,6 +119,31 @@ export class SqliteSessionPersistence extends SessionPersistence {
     return this.coordinator.appendFenced(id, events, writer)
   }
 
+  /**
+   * Read the session's durable ownership epoch.
+   * @param id - persisted session whose epoch is read.
+   * @param signal - optional cancellation for backend read work.
+   * @returns the stored epoch, or `undefined` when the session is absent.
+   */
+  async ownershipEpochOf(id: SessionId, signal?: AbortSignal): Promise<number | undefined> {
+    return this.store.ownershipEpochOf(id, signal)
+  }
+
+  /**
+   * Advance a session's durable ownership epoch with an atomic compare-and-swap:
+   * the stored epoch must equal `fromEpoch`. `false` means the stored epoch
+   * already moved past `fromEpoch` — the caller lost ownership and must not
+   * write. Never throws on a stale epoch.
+   * @param id - persisted session whose epoch is advanced.
+   * @param fromEpoch - epoch the caller currently owns.
+   * @param toEpoch - strictly greater epoch the caller claims.
+   * @returns true when the CAS advanced the epoch, false when the stored epoch
+   *   is no longer `fromEpoch`.
+   */
+  async advanceOwnershipEpoch(id: SessionId, fromEpoch: number, toEpoch: number): Promise<boolean> {
+    return this.store.advanceOwnershipEpoch(id, fromEpoch, toEpoch)
+  }
+
   override prepare(id: SessionId, signal?: AbortSignal): Promise<SessionPreparation> {
     return this.coordinator.prepare(id, signal)
   }

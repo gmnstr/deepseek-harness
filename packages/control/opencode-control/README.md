@@ -41,9 +41,10 @@ Every payload carries a `version` field and branded ids (`ExecutionId`, `ActionI
 Producers import the typed factories from the package root and append the result through their own `Session`:
 
 ```ts
-import { Session } from '@deepseek-ai/dsh-session'
-import { ExecutionId, effectRequested } from '@deepseek-ai/dsh-opencode-control'
+import SessionStore, { Session, SessionId } from '@deepseek-ai/dsh-session'
+import { ActionId, ExecutionId, effectRequested } from '@deepseek-ai/dsh-opencode-control'
 
+const session = Session.create(SessionId('exec-1'))
 const execution = ExecutionId('exec-1')
 session.append('effect/requested', effectRequested({
   execution_id: execution,
@@ -100,18 +101,23 @@ Read these pages when the package-level contract is not enough.
 <a id="model-experience"></a>
 ## Model Experience
 
-### What the model sees
+### Control-plane recording
+
+#### What the model sees
 
 Nothing. Every control event is log-only: it never contributes to `deriveMessages()`, so the model's request context is byte-identical whether or not this package is mounted. The events exist to make the control plane's decisions durable and replayable, not to change the conversation.
 
-### Token and KV-cache effect
+#### Token effect
 
-None. Because the events never join the derived message history, they add no tokens to model requests and no KV-cache entries.
+None. Because the events never join the derived message history, they add no tokens to model requests.
 
------
+#### KV Cache effect
+
+None. The events never join the derived message history, so they add no KV-cache entries.
+
+## Known Limitations and Deferred Work
 
 <a id="known-limitations-and-deferred-work"></a>
-## Known Limitations and Deferred Work
 
 These limits define when the package is a poor fit. They are current package constraints, not a task backlog.
 

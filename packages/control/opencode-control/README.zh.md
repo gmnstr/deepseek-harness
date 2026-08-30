@@ -41,9 +41,10 @@ kind: "package-reference"
 生产者从包根导入类型化工厂，并通过自己的 `Session` 追加结果：
 
 ```ts
-import { Session } from '@deepseek-ai/dsh-session'
-import { ExecutionId, effectRequested } from '@deepseek-ai/dsh-opencode-control'
+import SessionStore, { Session, SessionId } from '@deepseek-ai/dsh-session'
+import { ActionId, ExecutionId, effectRequested } from '@deepseek-ai/dsh-opencode-control'
 
+const session = Session.create(SessionId('exec-1'))
 const execution = ExecutionId('exec-1')
 session.append('effect/requested', effectRequested({
   execution_id: execution,
@@ -100,18 +101,23 @@ session.append('effect/requested', effectRequested({
 <a id="model-experience"></a>
 ## 模型体验
 
-### 模型看到什么
+### 控制平面记录
+
+#### 模型看到什么
 
 什么都没有。每个控制事件都仅用于日志：它从不贡献给 `deriveMessages()`，因此无论是否挂载此包，模型的请求上下文都逐字节相同。这些事件的存在是为了让控制平面的决定可持久化、可回放，而不是改变对话。
 
-### Token 与 KV 缓存影响
+#### Token 影响
 
-无。因为这些事件从不加入派生的消息历史，它们不会给模型请求增加 token，也不会增加 KV 缓存条目。
+无。因为这些事件从不加入派生的消息历史，它们不会给模型请求增加 token。
 
------
+#### KV 缓存影响
+
+无。这些事件从不加入派生的消息历史，因此不会增加 KV 缓存条目。
+
+## 已知限制与延后工作
 
 <a id="known-limitations-and-deferred-work"></a>
-## 已知限制与延后工作
 
 这些限制定义了此包何时不是好的选择。它们是当前的包约束，而不是任务积压。
 
