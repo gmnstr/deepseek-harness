@@ -7,10 +7,18 @@
  *    fenced (no mutation); Owner B appends; the log stays contiguous.
  * 2. The migration CAS is atomic across processes: a second migrate from the
  *    same source epoch loses.
- * 3. Race: concurrent A-append(epoch 0) vs B-migrate(0→1) — exactly one
- *    deterministic winner per SQLite transaction; the loser fences; no
- *    sequence corruption and no duplicate semantic event.
- * 4. A stale writer's token stays dead across a restart (fencing is durable,
+ * 3. Race: concurrent same-epoch appends — serialized by SQLite
+ *    `begin-immediate`, no sequence corruption and no duplicate semantic
+ *    event, each loser classified by its real failure class.
+ * 4. Race: append(epoch 0) vs migrate(0→1) on a GENUINELY durable epoch-0
+ *    slot (row materialized + event seq 0 committed before any racer starts).
+ *    Both legal orderings are proven reachable and safe: migration-first →
+ *    stale epoch-0 append is durably fenced; append-first → the append
+ *    commits at seq 1 and the migrate CAS still wins after (epoch → 1), so
+ *    the stale probe is fenced either way. Final epoch/log state matches the
+ *    actual transaction winner; no sequence corruption and no duplicate
+ *    semantic event.
+ * 5. A stale writer's token stays dead across a restart (fencing is durable,
  *    not an in-memory flag).
  * @module @deepseek-ai/dsh-opencode-execution/tests/a6-cross-process-fencing
  */
@@ -22,8 +30,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
-import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
+import SessionStore, { type SessionEvent, SessionId } from '@deepseek-ai/dsh-session'
 import SessionPersistenceSqlite from '@deepseek-ai/dsh-session-persistence-sqlite'
+import { executionCommanded, ExecutionId } from '@deepseek-ai/dsh-opencode-control'
 
 const dirs: string[] = []
 afterEach(async () => {
@@ -53,6 +62,29 @@ function owner(dbPath: string, sessionId: string, ...args: string[]): Record<str
   return facts
 }
 
+/**
+ * Genuinely materialize a durable epoch-0 session: `create()` only records
+ * intent (no SQLite row until the first append), so `create()` alone cannot
+ * give the migration CAS a real row to contend for. A real append at epoch 0
+ * (event seq 0) commits the metadata row + event through the service, making
+ * the epoch-0 slot durable before any racer starts. The appended event is the
+ * caller's setup event; the log therefore starts at seq 0.
+ */
+async function setupEpochZeroSession(dbPath: string, sessionId: SessionId): Promise<void> {
+  const setup = new Context()
+  await setup.plugin(SessionStore)
+  await setup.plugin(SessionPersistenceSqlite, { path: dbPath, writeBatchMaxDelayMs: 1_000 })
+  await setup.sessionPersistence.create({ version: 0, id: sessionId, createdAt: 1_000, cwd: '/workspace' })
+  const setupEvent: SessionEvent = {
+    type: 'execution/commanded',
+    seq: 0,
+    time: 1_000,
+    data: executionCommanded({ execution_id: ExecutionId('setup'), command: 'setup', source: 'surface' }),
+  }
+  await setup.sessionPersistence.appendFenced(sessionId, [setupEvent], { worker_id: 'a6-setup', ownership_epoch: 0 })
+  await setup.fiber.dispose()
+}
+
 /** Read the persisted canonical log length + seqs from the DSH DB. */
 async function readLog(dbPath: string, sessionId: SessionId): Promise<{ length: number; seqs: number[] }> {
   const ctx = new Context()
@@ -63,9 +95,9 @@ async function readLog(dbPath: string, sessionId: SessionId): Promise<{ length: 
   return { length: events.length, seqs: events.map(e => e.seq) }
 }
 
-/** Spawn one owner child process asynchronously; resolves with its printed facts. */
+/** Spawn one owner child process asynchronously; rejects on non-zero exit. */
 function runOwnerChild(dbPath: string, sessionId: string, ...args: string[]): Promise<Record<string, string>> {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const child = spawn(
       process.execPath,
       ['--import', 'tsx/esm', OWNER_PATH, dbPath, sessionId, ...args],
@@ -76,11 +108,19 @@ function runOwnerChild(dbPath: string, sessionId: string, ...args: string[]): Pr
     )
     let out = ''
     child.stdout.on('data', (d) => { out += String(d) })
-    child.on('exit', () => {
+    child.on('error', reject)
+    child.on('exit', (code) => {
       const facts: Record<string, string> = {}
       for (const line of out.split('\n')) {
         const eq = line.indexOf('=')
         if (eq > 0) facts[line.slice(0, eq)] = line.slice(eq + 1)
+      }
+      // The fixture exits non-zero ONLY on an unexpected failure (RESULT=ERROR
+      // or a crash). An unexpected error must FAIL the test, never be
+      // mistaken for valid fencing evidence.
+      if (code !== 0 && !facts.RESULT?.startsWith('FENCED') && !facts.RESULT?.startsWith('SEQ_CONFLICT')) {
+        reject(new Error(`owner child exited ${code} with ${JSON.stringify(facts)}`))
+        return
       }
       resolve(facts)
     })
@@ -131,31 +171,27 @@ describe('A6 cross-process fencing (real durable backend)', () => {
     expect(owner(path, String(sessionId), 'epoch').EPOCH).toBe('2')
   })
 
-  it('race: two concurrent appends at the same epoch have exactly one deterministic winner and no corruption', { timeout: 30_000 }, async () => {
+  it('race: two concurrent appends at the same epoch serialize with no corruption; losers are seq-conflicts, never fencing', { timeout: 30_000 }, async () => {
     const path = await freshDbPath('dsh-a6-race-append-')
     const sessionId = SessionId('a6-race-append')
 
-    // Establish the session at epoch 0 in-process with one event (seq 0).
-    const setup = new Context()
-    await setup.plugin(SessionStore)
-    await setup.plugin(SessionPersistenceSqlite, { path, writeBatchMaxDelayMs: 1_000 })
-    await setup.sessionPersistence.create({ version: 0, id: sessionId, createdAt: 1_000, cwd: '/workspace' })
-    await setup.fiber.dispose()
-    expect(owner(path, String(sessionId), 'append', '0').RESULT === 'APPENDED').toBe(true)
+    // A genuinely durable epoch-0 slot: metadata row + event seq 0 committed.
+    await setupEpochZeroSession(path, sessionId)
 
     // Two independent owner processes race to append at epoch 0. SQLite
-    // begin-immediate serializes them: the two appends may both commit at
-    // contiguous seqs (1 then 2), or one may fence on a seq/epoch conflict.
-    // The invariant is NO sequence corruption and NO duplicate semantic event:
-    // the log must stay contiguous with exactly the winning append(s), and no
-    // two events may share a seq.
+    // begin-immediate serializes them: both appends may commit at contiguous
+    // seqs (1 then 2), or the loser may re-derive a stale cursor and hit a
+    // seq-conflict. Same-epoch appends can NEVER produce a fencing rejection
+    // (the epoch matches), so a FENCED result here would be an unexpected
+    // defect; an ERROR result would fail the test via the child exit code.
     const [a, b] = await Promise.all([
       runOwnerChild(path, String(sessionId), 'append', '0'),
       runOwnerChild(path, String(sessionId), 'append', '0'),
     ])
-    const aWon = a.RESULT === 'APPENDED'
-    const bWon = b.RESULT === 'APPENDED'
-    const winners = (aWon ? 1 : 0) + (bWon ? 1 : 0)
+    for (const result of [a, b]) {
+      expect(['APPENDED', 'SEQ_CONFLICT'].includes(result.RESULT ?? '')).toBe(true)
+    }
+    const winners = (a.RESULT === 'APPENDED' ? 1 : 0) + (b.RESULT === 'APPENDED' ? 1 : 0)
     expect(winners).toBeGreaterThanOrEqual(1)
 
     // No corruption: the setup event (seq 0) plus the winner(s), always
@@ -166,46 +202,98 @@ describe('A6 cross-process fencing (real durable backend)', () => {
     expect(new Set(log.seqs).size).toBe(log.seqs.length)
   })
 
-  it('race: concurrent append(epoch 0) vs migrate(0→1) — one wins the slot; no corruption, no duplicate event', { timeout: 30_000 }, async () => {
+  it('append vs migrate on a durable epoch-0 slot: migration-first durably fences the stale writer', { timeout: 30_000 }, async () => {
+    const path = await freshDbPath('dsh-a6-race-migrate-first-')
+    const sessionId = SessionId('a6-race-migrate-first')
+
+    // A genuinely durable epoch-0 slot: metadata row + event seq 0 committed.
+    // Both racers contend for this REAL row — the migration CAS targets an
+    // existing row, so migrate-first is genuinely reachable.
+    await setupEpochZeroSession(path, sessionId)
+
+    // FORCED migration-first ordering: migrate wins the slot before the
+    // append starts.
+    expect(owner(path, String(sessionId), 'migrate', '0', '1').RESULT === 'MIGRATED').toBe(true)
+
+    // The stale epoch-0 append MUST be durably fenced (classified by the real
+    // SessionOwnershipFencedError type, message pinning the stored epoch 1).
+    const stale = owner(path, String(sessionId), 'append', '0')
+    expect(stale.RESULT).toMatch(/^FENCED/)
+    expect(stale.RESULT).toMatch(/owned by epoch 1/)
+
+    // Final state matches the actual winner: epoch 1, log = [0] (only the
+    // setup event; the stale append mutated nothing).
+    expect(owner(path, String(sessionId), 'epoch').EPOCH).toBe('1')
+    const log = await readLog(path, sessionId)
+    expect(log.length).toBe(1)
+    expect(log.seqs).toEqual([0])
+  })
+
+  it('append vs migrate on a durable epoch-0 slot: append-first commits, then the CAS still migrates and fences the stale token', { timeout: 30_000 }, async () => {
+    const path = await freshDbPath('dsh-a6-race-append-first-')
+    const sessionId = SessionId('a6-race-append-first')
+
+    // A genuinely durable epoch-0 slot: metadata row + event seq 0 committed.
+    await setupEpochZeroSession(path, sessionId)
+
+    // FORCED append-first ordering: the epoch-0 append commits first (seq 1).
+    expect(owner(path, String(sessionId), 'append', '0').RESULT === 'APPENDED').toBe(true)
+
+    // The migration CAS is sequence-independent: it advances the epoch even
+    // though the append committed first (the stored epoch was still 0).
+    expect(owner(path, String(sessionId), 'migrate', '0', '1').RESULT === 'MIGRATED').toBe(true)
+
+    // The stale epoch-0 token is now fenced durably.
+    const stale = owner(path, String(sessionId), 'append', '0')
+    expect(stale.RESULT).toMatch(/^FENCED/)
+    expect(stale.RESULT).toMatch(/owned by epoch 1/)
+
+    // Final state matches the actual winner: epoch 1, log = [0, 1] (the
+    // setup event plus the append that won the seq slot), contiguous.
+    expect(owner(path, String(sessionId), 'epoch').EPOCH).toBe('1')
+    const log = await readLog(path, sessionId)
+    expect(log.length).toBe(2)
+    expect(log.seqs).toEqual([0, 1])
+  })
+
+  it('race: concurrent append(epoch 0) vs migrate(0→1) on a durable slot — no corruption, no duplicate event, final state matches the winner', { timeout: 30_000 }, async () => {
     const path = await freshDbPath('dsh-a6-race-')
     const sessionId = SessionId('a6-race')
 
-    // Establish the session at epoch 0 in-process (both racers need a real
-    // existing epoch-0 slot to contend for, not a fresh create inside each
-    // child).
-    const setup = new Context()
-    await setup.plugin(SessionStore)
-    await setup.plugin(SessionPersistenceSqlite, { path, writeBatchMaxDelayMs: 1_000 })
-    await setup.sessionPersistence.create({ version: 0, id: sessionId, createdAt: 1_000, cwd: '/workspace' })
-    await setup.fiber.dispose()
+    // A genuinely durable epoch-0 slot: metadata row + event seq 0 committed.
+    // Both racers contend for this REAL row; the migration CAS cannot win
+    // vacuously against an absent row (the A6-1 vacuity defect).
+    await setupEpochZeroSession(path, sessionId)
 
     const [appendResult, migrateResult] = await Promise.all([
       runOwnerChild(path, String(sessionId), 'append', '0'),
       runOwnerChild(path, String(sessionId), 'migrate', '0', '1'),
     ])
+    // The append either commits (APPENDED) or is durably fenced (FENCED) —
+    // never a seq-conflict (the append targets the fresh tail) and never an
+    // unexpected ERROR. runOwnerChild already rejects on an unexpected exit.
+    expect(appendResult.RESULT === 'APPENDED' || (appendResult.RESULT ?? '').startsWith('FENCED')).toBe(true)
+    // The migration CAS ALWAYS wins here: if the append commits first (epoch
+    // still 0), the CAS still advances 0→1; if the migration wins first, the
+    // append fences. Either way the stored epoch ends at 1.
+    expect(migrateResult.RESULT === 'MIGRATED').toBe(true)
     const appendWon = appendResult.RESULT === 'APPENDED'
-    const migrateWon = migrateResult.RESULT === 'MIGRATED'
 
-    // No corruption: the log has zero or one event (the append), contiguous.
+    // No corruption: the log is the setup event (seq 0) plus the append if
+    // and only if it won — always contiguous, never duplicate seqs.
     const log = await readLog(path, sessionId)
-    expect(log.length).toBe(appendWon ? 1 : 0)
-    expect(log.seqs).toEqual(appendWon ? [0] : [])
+    expect(log.length).toBe(appendWon ? 2 : 1)
+    expect(log.seqs).toEqual(appendWon ? [0, 1] : [0])
 
-    // Stored epoch reflects the migration.
-    const epoch = owner(path, String(sessionId), 'epoch').EPOCH
-    expect(epoch).toBe(migrateWon ? '1' : '0')
+    // Stored epoch is 1 in every ordering.
+    expect(owner(path, String(sessionId), 'epoch').EPOCH).toBe('1')
 
-    // The decisive one-way fence: once the epoch advanced to 1 (the migration
-    // won), a stale epoch-0 append MUST be rejected durably. If the append won
-    // first (epoch still 0), the migration's CAS lost to nothing and epoch
-    // stays 0, so a stale append at epoch 0 legitimately appends.
+    // The decisive one-way fence: after the race, the epoch is 1, so a stale
+    // epoch-0 append MUST be rejected durably — whether or not the racing
+    // append committed.
     const staleProbe = owner(path, String(sessionId), 'append', '0')
-    if (migrateWon) {
-      expect(staleProbe.RESULT).toMatch(/^FENCED/)
-      expect(staleProbe.RESULT).toMatch(/owned by epoch 1/)
-    } else {
-      expect(staleProbe.RESULT === 'APPENDED' || (staleProbe.RESULT ?? '').startsWith('FENCED')).toBe(true)
-    }
+    expect(staleProbe.RESULT).toMatch(/^FENCED/)
+    expect(staleProbe.RESULT).toMatch(/owned by epoch 1/)
   })
 
   it('a stale writer token stays dead across a restart (fencing is durable, not an in-memory flag)', { timeout: 30_000 }, async () => {
