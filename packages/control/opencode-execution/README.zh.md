@@ -30,7 +30,7 @@ kind: "package-reference"
 ### 它增加了什么
 
 - **`ExecutionRuntime`** —— 串行化会话参与者。`beginExecution`、`correlateActivity`、`requestEffect` / `authorizeEffect` / `denyEffect` / `startAttempt` / `succeedEffect` / `failEffect` / `commitUnknown` / `reconcileEffect` 各自通过 `appendFenced` 追加对应的 A1 控制事件。`migrateOwnership(from, to, worker)` 以原子 CAS（`advanceOwnershipEpoch`）推进持久的所有权纪元，绝不追加 `OwnershipMigrated` 事件——栅栏是持久化元数据，不是事件。
-- **`EffectExecutor`** —— 在真实 DSH 底座上的内核门控效果安全：结构验证 → 类型化能力授权 → 权威 `effect/requested` + `effect/authorized`／`effect/denied` → 派生 outbox 工作视图 → 带重试的作用域 worker（每次重试追加一个不同的 `effect/attempt-started`）→ 权威结果。`commit-unknown` 打破循环（绝不盲目重试 IRREVERSIBLE）；专用的 `reconcile()` 仅解决 `commit-unknown` 动作，使用独立的 `${action_id}:reconcile:1` 尝试 id 并传递 `reconcile: true`。
+- **`EffectExecutor`** —— 在真实 DSH 底座上的内核门控效果安全：结构验证 → 类型化能力授权 → 权威 `effect/requested` + `effect/authorized`／`effect/denied` → 派生 outbox 工作视图 → 带重试的作用域 worker（每次重试追加一个不同的 `effect/attempt-started`）→ 权威结果。`commit-unknown` 打破循环（绝不盲目重试 IRREVERSIBLE）；专用的 `reconcile()` 解决任意「模糊」动作——显式的 `commit-unknown`，或一个「孤儿」`attempt-started`（worker 在派发与返回之间被杀）——使用从权威日志派生的单调递增 `${action_id}:reconcile:${n}` 尝试 id 并传递 `reconcile: true`。对已解决或模糊动作的第二次 `execute()` 被拒绝（`ERR_EFFECT_REENTRY`）。
 - **`foldProjection`** —— 纯确定性折叠：相同的 DSH 事件总是产生相同的 `DerivedSessionState`，其 sha256 摘要会在任何事件的类型、序号或数据变化时改变。派生状态只是 DSH 日志的函数。
 - **`CapabilityKernel`** —— 类型化权限边界：带正向、作用域的、带外铸造的能力；缺失即拒绝；文本永远不能授予权限。
 
@@ -78,7 +78,7 @@ await runtime.beginExecution(ExecutionId('exec-1'), 'git status', 'surface')
 | [`src/ledger-deriver.ts`](src/ledger-deriver.ts) | `readFromDsh` / `deriveAll` —— 被降级写入路径的审计面 |
 | [`src/capability.ts`](src/capability.ts) | 类型化 `CapabilityKernel`：正向权限，缺失即拒绝，文本永不授予权限 |
 | [`src/execution-runtime.ts`](src/execution-runtime.ts) | 串行化会话参与者；唯一的权威写入入口（`appendControl` → `appendFenced`） |
-| [`src/effect-executor.ts`](src/effect-executor.ts) | 内核门控的效果调度、重试、`commit-unknown` → `reconcile()`、`ERR_EFFECT_REENTRY` 守卫 |
+| [`src/effect-executor.ts`](src/effect-executor.ts) | 内核门控的效果调度、重试、模糊（`commit-unknown`／孤儿尝试）→ `reconcile()`、单调对账尝试 id、`ERR_EFFECT_REENTRY` 守卫 |
 | [`src/invariant.ts`](src/invariant.ts) | 不变量伴生：没有可观察的进程内关系（投影与运行时测试负责这些检查） |
 | [`A3-MUTATION-AUDIT.md`](A3-MUTATION-AUDIT.md) | 旧 `ExecutionLedger` 的每个变更入口 → 其 DSH 权威对应物与处置 |
 
@@ -129,7 +129,7 @@ await runtime.beginExecution(ExecutionId('exec-1'), 'git status', 'surface')
 这些限制定义了此包何时不是好的选择。它们是当前的包约束，而不是任务积压。
 
 - **派生投影，不是第二权威。** 此包概念上取代的 SQLite 投影是可丢弃的：删除它并从 DSH 日志重建。DSH 日志是唯一持久的真相；在此包范围内，运行时本身不写任何 SQLite 行。
-- **真实外部效果的对账协议延后（P4+）。** `reconcile()` 通过带 `reconcile: true` 的 worker 解决先前的 `commit-unknown`；生产级对账协议（外部状态检查、幂等键、saga 补偿）不在此范围内。
+- **真实外部效果的对账协议延后（P4+）。** `reconcile()` 通过带 `reconcile: true` 与单调递增对账尝试 id 的 worker 解决模糊动作（先前的 `commit-unknown`，或一个孤儿 `attempt-started`——其 worker 在派发与返回之间死亡）；生产级对账协议（外部状态检查、幂等键、saga 补偿）不在此范围内。
 - **派生的 outbox 是工作视图，不是持久的。** `EffectExecutor.outbox()` 在调用时折叠 DSH 日志；它是调度恢复点，绝不是真相来源。
 - **没有超出 A1 词汇的生命周期事件。** 没有 `execution/settled` 事件。结算从规范终态事实 DERIVED（派生）：当该执行请求的每个效应都达到终态派生结果（`succeeded` / `failed` / `reconciled` / `denied`）时，该执行被视为已结算；带有挂起或模糊（`commit-unknown`）效应的执行 NOT 结算；未请求任何效应的执行按构造即已结算。折叠从不把「日志恰好在此结束」当作终态信号。
 - **实时原生会话被排除在运行时拥有的会话之外。** 运行时仅通过 `appendFenced` 写入；实时 `Session` 的写回路径未加栅栏。在同一个后端中，绑定到运行时已栅栏实体化会话的实时 `Session` 会被拒绝（种子不匹配的 id 冲突），因此两种写入模式不能共同拥有同一个会话 id。任何确实写入的未加栅栏写入仍会被派生折叠观察到（digest/last-seq 变化），因此第二权威写入无法静默损坏派生状态。

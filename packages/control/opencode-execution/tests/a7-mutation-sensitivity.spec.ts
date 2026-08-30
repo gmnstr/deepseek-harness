@@ -102,7 +102,7 @@ describe('A7 mutation sensitivity on converged seams', () => {
     const read = (rel: string) => readFileSync(join(SRC, rel), 'utf8')
     const axes: Array<{ name: string; file: string; seam: string }> = [
       { name: 'capability-authorization', file: 'effect-executor.ts', seam: 'if (!decision.authorized) {' },
-      { name: 'effect-reentry-guard', file: 'effect-executor.ts', seam: "if (effect.outcome === 'succeeded' || effect.outcome === 'reconciled' || effect.outcome === 'commit-unknown') {" },
+      { name: 'effect-reentry-guard', file: 'effect-executor.ts', seam: "const terminalOrAmbiguous = effect.outcome === 'succeeded' || effect.outcome === 'reconciled'\n      || effect.outcome === 'commit-unknown' || effect.ambiguous\n    if (terminalOrAmbiguous) {" },
       { name: 'commit-unknown-never-blind-retried', file: 'effect-executor.ts', seam: 'outcome = { kind: \'commit-unknown\' }' },
       { name: 'single-canonical-write-entry', file: 'execution-runtime.ts', seam: 'await this.persistence.appendFenced(' },
     ]
@@ -143,7 +143,7 @@ describe('A7 mutation sensitivity on converged seams', () => {
 
   it('mutation: disabling the re-entry guard permits a duplicate dispatch of an ambiguous action', async () => {
     const real = readFileSync(join(SRC, 'effect-executor.ts'), 'utf8')
-    const guard = "if (effect.outcome === 'succeeded' || effect.outcome === 'reconciled' || effect.outcome === 'commit-unknown') {"
+    const guard = "const terminalOrAmbiguous = effect.outcome === 'succeeded' || effect.outcome === 'reconciled'\n      || effect.outcome === 'commit-unknown' || effect.ambiguous\n    if (terminalOrAmbiguous) {"
     expect(real.includes(guard)).toBe(true)
     const mutated = real.replace(guard, 'if (false) {')
     expect(mutated !== real).toBe(true)
@@ -197,16 +197,21 @@ describe('A7 mutation sensitivity on converged seams', () => {
     // commit-unknown would be dropped — later terminal events referencing it
     // would fail `requireAttemptStarted`, breaking recovery.
     const real = readFileSync(join(SRC, 'projection.ts'), 'utf8')
-    const seam = 'return { ...current, outcome, attempt_ids: [...current.attempt_ids, payload.attempt_id] }'
+    const seam = 'const next = { ...current, outcome, attempt_ids: [...current.attempt_ids, payload.attempt_id] }'
     expect(real.includes(seam)).toBe(true)
     // Mutation: only append the attempt id when the outcome is NOT sticky.
     const mutated = real.replace(
       seam,
-      'return current.outcome === \'commit-unknown\' || current.outcome === \'succeeded\' || current.outcome === \'reconciled\'\n            ? current\n            : { ...current, outcome, attempt_ids: [...current.attempt_ids, payload.attempt_id] }',
+      'const next = current.outcome === \'commit-unknown\' || current.outcome === \'succeeded\' || current.outcome === \'reconciled\'\n            ? current\n            : { ...current, outcome, attempt_ids: [...current.attempt_ids, payload.attempt_id] }',
     )
     expect(mutated !== real).toBe(true)
 
-    const m = await loadMutated<{ foldProjection: (events: readonly unknown[], sessionId: string) => any }>(
+    const m = await loadMutated<{
+      foldProjection: (
+        events: readonly unknown[],
+        sessionId: string,
+      ) => { effects: ReadonlyMap<string, { attempt_ids: readonly unknown[] }> }
+    }>(
       'projection.m.ts',
       mutated,
     )

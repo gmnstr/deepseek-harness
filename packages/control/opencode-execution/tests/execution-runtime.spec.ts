@@ -181,13 +181,13 @@ describe('ExecutionRuntime on real DSH backing', () => {
     await expect(runtime.startAttempt(execution, action, attempt))
       .rejects.toThrow(/effect attempt without authorization/)
 
-    // Reconciliation of an action that is not commit-unknown.
+    // Reconciliation of an action that is not ambiguous (succeeded).
     await runtime.requestEffect(execution, action, 'write', '/workspace/a', 'filesystem')
     await runtime.authorizeEffect(execution, action, 'fs.write')
     await runtime.startAttempt(execution, action, attempt)
     await runtime.succeedEffect(execution, action, attempt, { ok: true })
     await expect(runtime.reconcileEffect(execution, action, AttemptId('act-1:reconcile:1'), { ok: true }))
-      .rejects.toThrow(/only an ambiguous \(commit-unknown\) action can be reconciled/)
+      .rejects.toThrow(/only an ambiguous \(commit-unknown or orphaned-attempt\) action can be reconciled/)
 
     // Migration CAS that lost (epoch already advanced) is fenced.
     await runtime.migrateOwnership(0, 1, 'worker-2')

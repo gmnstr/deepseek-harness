@@ -122,10 +122,14 @@ describe('foldProjection', () => {
     expect(foldProjection(withNative, 'proj-1').digest).not.toBe(baseline.digest)
   })
 
-  it('proves delete/rebuild independence on a real SQLite temp DB', async () => {
+  it('proves fold invariance across DB files: the same DSH log content folds to the same derived state', async () => {
     // Build the DSH log via real SessionPersistenceSqlite on a temp DB file,
-    // fold → state1; close+delete the derived SQLite; reopen; re-load from
-    // DSH; fold → state2; assert state1 == state2.
+    // fold → state1; delete the DB; re-append the SAME canonical facts into a
+    // fresh DB (the derived projection is disposable; only the DSH log's
+    // canonical facts survive); fold → state2; assert state1 == state2. The
+    // process-boundary delete/rebuild gate lives in a4-delete-rebuild.spec.ts;
+    // this in-package test proves the fold is a pure function of the log
+    // content regardless of which DB file (or process) holds it.
     const dir = await mkdtemp(join(tmpdir(), 'dsh-proj-invariance-'))
     const path = join(dir, 'sessions.db')
     const sessionId = SessionId('proj-invariance')

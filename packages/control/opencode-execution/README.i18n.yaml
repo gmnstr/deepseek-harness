@@ -2,5 +2,5 @@
 # side as of the last confirmed-consistent state. Both languages carry equal authority;
 # after editing either side, bring the other along and re-record with:
 #   pnpm run verify-translation-pairing --write packages/control/opencode-execution/README.md
-README.md: d331edbda7bbabd3bd73d3e960a2e22d3b2c0219
-README.zh.md: 689e06804e360313230135d260405ea29ffaee3e
+README.md: 661c19a76e318d3f062f7d411793bc5a5d67d9d2
+README.zh.md: f83866ffc3c33af2564ae60124bf4527b532869e

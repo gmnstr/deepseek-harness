@@ -115,6 +115,7 @@ function outboxRecord(effect: DerivedEffect): OutboxRecord {
   const state: OutboxRecord['state'] = (() => {
     switch (effect.outcome) {
       case 'requested':
+        return 'queued'
       case 'authorized':
       case 'attempt-started':
         return 'dispatched'
@@ -135,6 +136,21 @@ function outboxRecord(effect: DerivedEffect): OutboxRecord {
     capability_id: effect.capability_id ?? null,
     state,
   }
+}
+
+/**
+ * Derive the next monotonic reconcile probe attempt id for an action FROM the
+ * canonical log: the reconcile index is the count of prior reconcile-probe
+ * attempts for the action, plus one. No worker-local counter participates —
+ * the id is a pure function of the DSH log, so repeated probes after a crash
+ * never collide.
+ * @param effect - the derived effect whose reconcile probes are counted.
+ * @returns the next `${action_id}:reconcile:${n}` attempt id.
+ */
+function nextReconcileAttemptId(effect: DerivedEffect): AttemptId {
+  const reconcileProbes = [...effect.attempt_ids].filter(attempt => String(attempt).startsWith(`${String(effect.action_id)}:reconcile:`))
+  const index = reconcileProbes.length + 1
+  return `${String(effect.action_id)}:reconcile:${index}` as AttemptId
 }
 
 /**
@@ -311,11 +327,13 @@ export class EffectExecutor {
   }
 
   /**
-   * Reconcile a prior `effect/commit-unknown` WITHOUT re-dispatching the
-   * mutation as fresh. Only an action in `commit-unknown` may be reconciled;
-   * the probe uses a distinct `${action_id}:reconcile:1` attempt id and passes
-   * `reconcile: true` to the worker so an IRREVERSIBLE effector checks external
-   * state instead of re-applying the mutation.
+   * Reconcile a prior ambiguity WITHOUT re-dispatching the mutation as fresh.
+   * Accepts an action whose derived state is ambiguous: either an explicit
+   * `effect/commit-unknown` outcome or an ORPHANED `attempt-started` with no
+   * terminal event (a worker killed between dispatch and outcome, FR-1). The
+   * probe uses a distinct monotonic `${action_id}:reconcile:${n}` attempt id
+   * derived from the canonical log and passes `reconcile: true` to the worker
+   * so an IRREVERSIBLE effector checks external state instead of re-applying.
    * @param input - action id, resource, and probe payload.
    * @returns the canonical reconciliation result.
    */
@@ -327,15 +345,15 @@ export class EffectExecutor {
     const actionId = action_id as ActionId
     const derived = await this.runtime.derive()
     const effect = derived.effects.get(actionId)
-    if (effect === undefined || effect.outcome !== 'commit-unknown') {
+    if (effect === undefined || !effect.ambiguous) {
       throw new AuthorityError(
-        `reconcile for action ${action_id} in state ${effect?.outcome ?? '(none)'}: only an ambiguous (commit-unknown) action can be reconciled`,
+        `reconcile for action ${action_id} in state ${effect?.outcome ?? '(none)'}: only an ambiguous (commit-unknown or orphaned-attempt) action can be reconciled`,
         'ERR_RECONCILE_UNEXPECTED_STATE',
       )
     }
 
     const worker = this.workers.get(effect.operation)
-    const attemptId = `${action_id}:reconcile:1` as AttemptId
+    const attemptId = nextReconcileAttemptId(effect)
     if (worker === undefined) {
       await this.runtime.startAttempt(effect.execution_id, actionId, attemptId)
       await this.runtime.failEffect(
@@ -377,7 +395,8 @@ export class EffectExecutor {
         decision: { authorized: true, capability_id: effect.capability_id ?? null, action_id, reason: `reconciliation of previously authorized action ${action_id}` },
       }
     }
-    // Still ambiguous: the action stays unresolved; never re-applied.
+    // Still ambiguous: the action stays unresolved; never re-applied. The next
+    // reconcile probe derives a higher monotonic index from the log.
     await this.runtime.commitUnknown(effect.execution_id, actionId, attemptId)
     return {
       result: { action_id: actionId, attempt_id: attemptId, outcome },
@@ -386,9 +405,11 @@ export class EffectExecutor {
   }
 
   /**
-   * FR-3-01 re-entry guard: a second execute() for an action already in
-   * succeeded/reconciled/commit-unknown is rejected. The guard sits AFTER the
-   * kernel check so a kernel denial for an already-terminal action is harmless.
+   * FR-3-01 + FR-1 re-entry guard: a second execute() for an action already in
+   * succeeded/reconciled/commit-unknown — or with an ORPHANED attempt (a
+   * `attempt-started` with no terminal event after it, the crash-window
+   * ambiguity) — is rejected. The guard sits AFTER the kernel check so a kernel
+   * denial for an already-terminal action is harmless.
    * @param actionId - the action being (re)dispatched.
    * @throws `AuthorityError` with code `ERR_EFFECT_REENTRY`.
    */
@@ -396,9 +417,11 @@ export class EffectExecutor {
     const derived = await this.runtime.derive()
     const effect = derived.effects.get(actionId)
     if (effect === undefined) return
-    if (effect.outcome === 'succeeded' || effect.outcome === 'reconciled' || effect.outcome === 'commit-unknown') {
+    const terminalOrAmbiguous = effect.outcome === 'succeeded' || effect.outcome === 'reconciled'
+      || effect.outcome === 'commit-unknown' || effect.ambiguous
+    if (terminalOrAmbiguous) {
       throw new AuthorityError(
-        `effect re-entry for action ${actionId}: already reached ${effect.outcome}; reconcile an ambiguous action via reconcile() and never re-dispatch`,
+        `effect re-entry for action ${actionId}: already reached ${effect.outcome}${effect.ambiguous ? ' (orphaned attempt; reconcile instead of re-dispatching)' : ''}; reconcile an ambiguous action via reconcile() and never re-dispatch`,
         'ERR_EFFECT_REENTRY',
       )
     }

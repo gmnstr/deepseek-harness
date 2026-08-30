@@ -138,6 +138,41 @@ describe('EffectExecutor on real DSH backing', () => {
     await ctx.fiber.dispose()
   })
 
+  it('FR-2: the derived outbox label distinguishes queued (requested) from dispatched (attempt-started)', async () => {
+    const path = await freshDbPath('dsh-exec-outbox-label-')
+    const sessionId = SessionId('exec-outbox-label')
+    const { ctx, runtime } = await boot(path, sessionId)
+    const external = makeExternal()
+    const kernel = new CapabilityKernel()
+    kernel.grant({
+      id: 'cap-write',
+      principal: 'model-session-1',
+      operation: 'fs.write',
+      resourceScope: 'fs:/srv/app/**',
+      effectClasses: ['IDEMPOTENT'],
+    })
+    const executor = new EffectExecutor({
+      runtime,
+      kernel,
+      workers: new Map([['fs.write', makeIdempotentWorker(external)]]),
+    })
+
+    // A proposal that is REQUESTED but denied is 'queued' in the outbox
+    // working view — a requested-but-not-dispatched action is never labeled
+    // dispatched.
+    await executor.execute(proposal({ resource: 'fs:/etc/shadow' }))
+    let outbox = await executor.outbox()
+    const denied = outbox.find(record => record.action_id === ActionId('act:write:1'))
+    expect(denied?.state).toBe('queued')
+
+    // After a successful dispatch the outbox record is 'succeeded'.
+    await executor.execute(proposal())
+    outbox = await executor.outbox()
+    const succeeded = outbox.find(record => record.action_id === ActionId('act:write:1'))
+    expect(succeeded?.state).toBe('succeeded')
+    await ctx.fiber.dispose()
+  })
+
   it('mechanically denies an adversarial text corpus via the typed kernel', async () => {
     const path = await freshDbPath('dsh-exec-adversarial-')
     const sessionId = SessionId('exec-adversarial')
@@ -351,5 +386,164 @@ describe('EffectExecutor on real DSH backing', () => {
     expect(after.effects.get(ActionId('act:patch:1'))?.attempt_ids)
       .toEqual([AttemptId('act:patch:1:1'), AttemptId('act:patch:1:reconcile:1')])
     await fresh.fiber.dispose()
+  })
+
+  it('FR-1: a worker killed AFTER attempt-started but BEFORE any outcome leaves an orphaned attempt derived as ambiguous — recoverable via reconcile(), never re-dispatched', async () => {
+    const path = await freshDbPath('dsh-exec-orphan-')
+    const sessionId = SessionId('exec-orphan')
+    const { ctx, runtime } = await boot(path, sessionId)
+    const external = makeExternal()
+    const kernel = new CapabilityKernel()
+    kernel.grant({
+      id: 'cap-patch',
+      principal: 'model-session-1',
+      operation: 'fs.patch',
+      resourceScope: 'fs:/srv/app/**',
+      effectClasses: ['IRREVERSIBLE'],
+    })
+    const p = proposal({
+      action_id: 'act:patch:orphan',
+      attempt_id: 'act:patch:orphan:1',
+      operation: 'fs.patch',
+      resource: 'fs:/srv/app/seed.json',
+      effect_class: 'IRREVERSIBLE',
+      payload: { patch: 'DELETE /seed.json' },
+    })
+
+    // Simulate the crash-window kill: record the durable handoff
+    // (effect/requested + effect/authorized + effect/attempt-started) WITHOUT
+    // calling the worker — the process dies between dispatch and outcome.
+    await runtime.requestEffect(ExecutionId('exec-1'), ActionId('act:patch:orphan'), 'fs.patch', 'fs:/srv/app/seed.json', 'IRREVERSIBLE')
+    await runtime.authorizeEffect(ExecutionId('exec-1'), ActionId('act:patch:orphan'), 'cap-patch')
+    await runtime.startAttempt(ExecutionId('exec-1'), ActionId('act:patch:orphan'), AttemptId('act:patch:orphan:1'))
+    // NO terminal event: the worker never returned.
+    expect(external.rawCalls).toBe(0)
+
+    // The external mutation MAY have committed (the response was lost with the
+    // process). Derive: the orphaned attempt must be derived as ambiguous.
+    const derived = await runtime.derive()
+    const orphan = derived.effects.get(ActionId('act:patch:orphan'))
+    expect(orphan?.outcome).toBe('attempt-started')
+    expect(orphan?.ambiguous).toBe(true)
+    // The derived execution must NOT be settled while the effect is ambiguous.
+    expect(derived.executions.get(ExecutionId('exec-1'))?.settled).toBe(false)
+
+    // FR-3-01 + FR-1: a fresh execute() for this action MUST be rejected — the
+    // orphaned attempt must be reconciled, never re-dispatched.
+    const executor = new EffectExecutor({
+      runtime,
+      kernel,
+      workers: new Map([['fs.patch', makeIrreversibleWorker(external)]]),
+    })
+    await expect(executor.execute({ ...p, attempt_id: 'act:patch:orphan:retry:2' }))
+      .rejects.toMatchObject({ name: 'AuthorityError', code: 'ERR_EFFECT_REENTRY' })
+    expect(external.rawCalls).toBe(0) // no second dispatch
+
+    // The external system actually committed (response lost at kill). The
+    // reconcile probe observes it and records effect/reconciled WITHOUT a fresh
+    // dispatch.
+    external.db.set('fs:/srv/app/seed.json', 'committed-before-kill')
+    const r = await executor.reconcile({
+      action_id: 'act:patch:orphan',
+      resource: 'fs:/srv/app/seed.json',
+      payload: p.payload,
+    })
+    expect(r.result?.outcome.kind).toBe('succeeded')
+    expect(external.rawCalls).toBe(1) // exactly one reconcile probe, no re-apply
+
+    const after = await runtime.derive()
+    const resolved = after.effects.get(ActionId('act:patch:orphan'))
+    expect(resolved?.outcome).toBe('reconciled')
+    expect(resolved?.ambiguous).toBe(false)
+    expect(resolved?.attempt_ids)
+      .toEqual([AttemptId('act:patch:orphan:1'), AttemptId('act:patch:orphan:reconcile:1')])
+    await ctx.fiber.dispose()
+  })
+
+  it('FR-3: repeated reconcile probes use MONOTONIC attempt ids derived from the canonical log, never a fixed :reconcile:1', async () => {
+    const path = await freshDbPath('dsh-exec-reconcile-monotonic-')
+    const sessionId = SessionId('exec-reconcile-monotonic')
+    const { ctx, runtime } = await boot(path, sessionId)
+    const external = makeExternal()
+    const kernel = new CapabilityKernel()
+    kernel.grant({
+      id: 'cap-patch',
+      principal: 'model-session-1',
+      operation: 'fs.patch',
+      resourceScope: 'fs:/srv/app/**',
+      effectClasses: ['IRREVERSIBLE'],
+    })
+    const p = proposal({
+      action_id: 'act:patch:mono',
+      attempt_id: 'act:patch:mono:1',
+      operation: 'fs.patch',
+      resource: 'fs:/srv/app/seed.json',
+      effect_class: 'IRREVERSIBLE',
+      payload: { patch: 'DELETE /seed.json' },
+    })
+    // A worker whose FIRST reconcile probe stays ambiguous (external still
+    // resolving) and whose SECOND probe confirms the commit.
+    let reconcileProbes = 0
+    const monotonicWorker: EffectWorker = {
+      operation: 'fs.patch',
+      async execute(attempt) {
+        external.rawCalls++
+        if (attempt.reconcile) {
+          reconcileProbes++
+          if (reconcileProbes === 1) return { kind: 'commit-unknown' }
+          return { kind: 'succeeded', receipt: { resource: attempt.resource, reconciled: true } }
+        }
+        if (external.loseResponse) {
+          external.loseResponse = false
+          external.db.set(attempt.resource, String(attempt.payload))
+          return { kind: 'commit-unknown' }
+        }
+        external.db.set(attempt.resource, String(attempt.payload))
+        return { kind: 'succeeded', receipt: { resource: attempt.resource } }
+      },
+    }
+    const executor = new EffectExecutor({
+      runtime,
+      kernel,
+      workers: new Map([['fs.patch', monotonicWorker]]),
+    })
+
+    // First pass: ambiguous.
+    external.loseResponse = true
+    await executor.execute(p)
+    expect(external.rawCalls).toBe(1)
+
+    // First probe stays ambiguous (external still resolving): probe 1.
+    const probe1 = await executor.reconcile({
+      action_id: 'act:patch:mono',
+      resource: 'fs:/srv/app/seed.json',
+      payload: p.payload,
+    })
+    expect(probe1.result?.attempt_id).toBe('act:patch:mono:reconcile:1')
+    expect(probe1.result?.outcome.kind).toBe('commit-unknown')
+    expect(external.rawCalls).toBe(2)
+
+    // Second probe confirms the commit: a NEW monotonic attempt id.
+    const probe2 = await executor.reconcile({
+      action_id: 'act:patch:mono',
+      resource: 'fs:/srv/app/seed.json',
+      payload: p.payload,
+    })
+    expect(probe2.result?.attempt_id).toBe('act:patch:mono:reconcile:2')
+    expect(probe2.result?.outcome.kind).toBe('succeeded')
+    expect(external.rawCalls).toBe(3)
+
+    // The canonical log records BOTH reconcile probe attempts distinctly, and
+    // the action is reconciled once.
+    const derived = await runtime.derive()
+    const effect = derived.effects.get(ActionId('act:patch:mono'))
+    expect(effect?.outcome).toBe('reconciled')
+    expect(effect?.attempt_ids).toEqual([
+      AttemptId('act:patch:mono:1'),
+      AttemptId('act:patch:mono:reconcile:1'),
+      AttemptId('act:patch:mono:reconcile:2'),
+    ])
+    expect(effect?.ambiguous).toBe(false)
+    await ctx.fiber.dispose()
   })
 })

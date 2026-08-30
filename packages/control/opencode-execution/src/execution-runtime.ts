@@ -42,9 +42,9 @@ export type ControlAppend = {
   [Type in 'execution/commanded' | 'activity/correlated' | 'effect/requested'
     | 'effect/authorized' | 'effect/denied' | 'effect/attempt-started'
     | 'effect/succeeded' | 'effect/failed' | 'effect/commit-unknown' | 'effect/reconciled']: {
-      type: Type
-      data: SessionEventMap[Type]
-    }
+    type: Type
+    data: SessionEventMap[Type]
+  }
 }[
   'execution/commanded' | 'activity/correlated' | 'effect/requested'
     | 'effect/authorized' | 'effect/denied' | 'effect/attempt-started'
@@ -314,7 +314,11 @@ export class ExecutionRuntime {
 
   /**
    * Append `effect/reconciled` — an earlier unknown attempt was reconciled to
-   * a definite outcome.
+   * a definite outcome. Accepts an action whose derived state is AMBIGUOUS:
+   * either an explicit `effect/commit-unknown` outcome or an orphaned
+   * `effect/attempt-started` with no terminal event after it (a worker killed
+   * between dispatch and outcome — the crash-window ambiguity, FR-1). Both are
+   * reconciled via a probe that checks external state, never a blind re-dispatch.
    * @param execution_id - the execution that requested the effect.
    * @param action_id - the action that was reconciled.
    * @param attempt_id - the attempt that was reconciled.
@@ -328,9 +332,9 @@ export class ExecutionRuntime {
   ): Promise<void> {
     const derived = await this.derive()
     const effect = derived.effects.get(action_id)
-    if (effect === undefined || effect.outcome !== 'commit-unknown') {
+    if (effect === undefined || !effect.ambiguous) {
       throw new ControlTransitionError(
-        `reconcile for action ${action_id} in state ${effect?.outcome ?? '(none)'}: only an ambiguous (commit-unknown) action can be reconciled`,
+        `reconcile for action ${action_id} in state ${effect?.outcome ?? '(none)'}: only an ambiguous (commit-unknown or orphaned-attempt) action can be reconciled`,
       )
     }
     await this.appendControl('effect/reconciled', effectReconciled({ execution_id, action_id, attempt_id, receipt }))

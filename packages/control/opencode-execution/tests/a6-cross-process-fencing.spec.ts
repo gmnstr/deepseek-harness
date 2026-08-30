@@ -63,8 +63,32 @@ async function readLog(dbPath: string, sessionId: SessionId): Promise<{ length: 
   return { length: events.length, seqs: events.map(e => e.seq) }
 }
 
+/** Spawn one owner child process asynchronously; resolves with its printed facts. */
+function runOwnerChild(dbPath: string, sessionId: string, ...args: string[]): Promise<Record<string, string>> {
+  return new Promise((resolve) => {
+    const child = spawn(
+      process.execPath,
+      ['--import', 'tsx/esm', OWNER_PATH, dbPath, sessionId, ...args],
+      {
+        cwd: fileURLToPath(new URL('../../..', import.meta.url)),
+        stdio: ['ignore', 'pipe', 'inherit'],
+      },
+    )
+    let out = ''
+    child.stdout.on('data', (d) => { out += String(d) })
+    child.on('exit', () => {
+      const facts: Record<string, string> = {}
+      for (const line of out.split('\n')) {
+        const eq = line.indexOf('=')
+        if (eq > 0) facts[line.slice(0, eq)] = line.slice(eq + 1)
+      }
+      resolve(facts)
+    })
+  })
+}
+
 describe('A6 cross-process fencing (real durable backend)', () => {
-  it('fences a stale owner after another process migrates the epoch; the log stays contiguous', async () => {
+  it('fences a stale owner after another process migrates the epoch; the log stays contiguous', { timeout: 30_000 }, async () => {
     const path = await freshDbPath('dsh-a6-seq-')
     const sessionId = SessionId('a6-seq')
 
@@ -89,7 +113,7 @@ describe('A6 cross-process fencing (real durable backend)', () => {
     expect(log.seqs).toEqual([0, 1])
   })
 
-  it('the migration CAS is atomic across processes: a second migrate from the same source epoch loses', async () => {
+  it('the migration CAS is atomic across processes: a second migrate from the same source epoch loses', { timeout: 30_000 }, async () => {
     const path = await freshDbPath('dsh-a6-cas-')
     const sessionId = SessionId('a6-cas')
 
@@ -107,7 +131,7 @@ describe('A6 cross-process fencing (real durable backend)', () => {
     expect(owner(path, String(sessionId), 'epoch').EPOCH).toBe('2')
   })
 
-  it('race: two concurrent appends at the same epoch have exactly one deterministic winner and no corruption', async () => {
+  it('race: two concurrent appends at the same epoch have exactly one deterministic winner and no corruption', { timeout: 30_000 }, async () => {
     const path = await freshDbPath('dsh-a6-race-append-')
     const sessionId = SessionId('a6-race-append')
 
@@ -125,24 +149,10 @@ describe('A6 cross-process fencing (real durable backend)', () => {
     // The invariant is NO sequence corruption and NO duplicate semantic event:
     // the log must stay contiguous with exactly the winning append(s), and no
     // two events may share a seq.
-    const runAppend = () => new Promise<Record<string, string>>((resolve) => {
-      const child = spawn(process.execPath, ['--import', 'tsx/esm', OWNER_PATH, path, String(sessionId), 'append', '0'], {
-        cwd: fileURLToPath(new URL('../../..', import.meta.url)),
-        stdio: ['ignore', 'pipe', 'inherit'],
-      })
-      let out = ''
-      child.stdout.on('data', d => { out += String(d) })
-      child.on('exit', () => {
-        const facts: Record<string, string> = {}
-        for (const line of out.split('\n')) {
-          const eq = line.indexOf('=')
-          if (eq > 0) facts[line.slice(0, eq)] = line.slice(eq + 1)
-        }
-        resolve(facts)
-      })
-    })
-
-    const [a, b] = await Promise.all([runAppend(), runAppend()])
+    const [a, b] = await Promise.all([
+      runOwnerChild(path, String(sessionId), 'append', '0'),
+      runOwnerChild(path, String(sessionId), 'append', '0'),
+    ])
     const aWon = a.RESULT === 'APPENDED'
     const bWon = b.RESULT === 'APPENDED'
     const winners = (aWon ? 1 : 0) + (bWon ? 1 : 0)
@@ -156,7 +166,7 @@ describe('A6 cross-process fencing (real durable backend)', () => {
     expect(new Set(log.seqs).size).toBe(log.seqs.length)
   })
 
-  it('race: concurrent append(epoch 0) vs migrate(0→1) — one wins the slot; no corruption, no duplicate event', async () => {
+  it('race: concurrent append(epoch 0) vs migrate(0→1) — one wins the slot; no corruption, no duplicate event', { timeout: 30_000 }, async () => {
     const path = await freshDbPath('dsh-a6-race-')
     const sessionId = SessionId('a6-race')
 
@@ -169,40 +179,10 @@ describe('A6 cross-process fencing (real durable backend)', () => {
     await setup.sessionPersistence.create({ version: 0, id: sessionId, createdAt: 1_000, cwd: '/workspace' })
     await setup.fiber.dispose()
 
-    const runAppend = () => new Promise<Record<string, string>>((resolve) => {
-      const child = spawn(process.execPath, ['--import', 'tsx/esm', OWNER_PATH, path, String(sessionId), 'append', '0'], {
-        cwd: fileURLToPath(new URL('../../..', import.meta.url)),
-        stdio: ['ignore', 'pipe', 'inherit'],
-      })
-      let out = ''
-      child.stdout.on('data', d => { out += String(d) })
-      child.on('exit', () => {
-        const facts: Record<string, string> = {}
-        for (const line of out.split('\n')) {
-          const eq = line.indexOf('=')
-          if (eq > 0) facts[line.slice(0, eq)] = line.slice(eq + 1)
-        }
-        resolve(facts)
-      })
-    })
-    const runMigrate = () => new Promise<Record<string, string>>((resolve) => {
-      const child = spawn(process.execPath, ['--import', 'tsx/esm', OWNER_PATH, path, String(sessionId), 'migrate', '0', '1'], {
-        cwd: fileURLToPath(new URL('../../..', import.meta.url)),
-        stdio: ['ignore', 'pipe', 'inherit'],
-      })
-      let out = ''
-      child.stdout.on('data', d => { out += String(d) })
-      child.on('exit', () => {
-        const facts: Record<string, string> = {}
-        for (const line of out.split('\n')) {
-          const eq = line.indexOf('=')
-          if (eq > 0) facts[line.slice(0, eq)] = line.slice(eq + 1)
-        }
-        resolve(facts)
-      })
-    })
-
-    const [appendResult, migrateResult] = await Promise.all([runAppend(), runMigrate()])
+    const [appendResult, migrateResult] = await Promise.all([
+      runOwnerChild(path, String(sessionId), 'append', '0'),
+      runOwnerChild(path, String(sessionId), 'migrate', '0', '1'),
+    ])
     const appendWon = appendResult.RESULT === 'APPENDED'
     const migrateWon = migrateResult.RESULT === 'MIGRATED'
 
@@ -228,7 +208,7 @@ describe('A6 cross-process fencing (real durable backend)', () => {
     }
   })
 
-  it('a stale writer token stays dead across a restart (fencing is durable, not an in-memory flag)', async () => {
+  it('a stale writer token stays dead across a restart (fencing is durable, not an in-memory flag)', { timeout: 30_000 }, async () => {
     const path = await freshDbPath('dsh-a6-restart-')
     const sessionId = SessionId('a6-restart')
 

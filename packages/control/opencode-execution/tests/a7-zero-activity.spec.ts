@@ -2,10 +2,10 @@
  * P0 replay purity on real DSH backing (A7): the derived fold performs ZERO
  * nondeterministic activity. `foldProjection` and `deriveAll` are pure
  * functions of the canonical DSH log — they must never invoke a model, tool,
- * retrieval, effect worker, approval path, or identity mint. This is the
- * mechanical zero-invocation proof: instrumented sentinels on every activity
- * surface must remain uncalled across a full fold + derive + rebuild, and the
- * fold module's import surface must be contract-only.
+ * retrieval, effect worker, approval path, or identity mint. The purity claim
+ * rests on the fold's import surface being contract-only (mechanical audit
+ * below) plus identical-digest proofs across folds and across process
+ * boundaries.
  * @module @deepseek-ai/dsh-opencode-execution/tests/a7-zero-activity
  */
 
@@ -71,48 +71,20 @@ describe('P0 replay purity on real DSH backing', () => {
     await ctx.sessions.flush(session)
     await ctx.fiber.dispose()
 
-    // Activity sentinels. A replay/derive path that invoked any of these would
-    // break the P0 "replay performs no nondeterministic activity" invariant.
-    const sentinels = {
-      modelCall: 0,
-      toolCall: 0,
-      retrievalCall: 0,
-      effectDispatch: 0,
-      approvalPrompt: 0,
-      identityMint: 0,
-    }
-    const armed = {
-      model: () => { sentinels.modelCall += 1 },
-      tool: () => { sentinels.toolCall += 1 },
-      retrieval: () => { sentinels.retrievalCall += 1 },
-      effect: () => { sentinels.effectDispatch += 1 },
-      approval: () => { sentinels.approvalPrompt += 1 },
-      mint: () => { sentinels.identityMint += 1 },
-    }
-
-    // Fold the real persisted log twice; derive once. None of the sentinels may
-    // fire — a pure fold has no client reference to call.
+    // Fold the real persisted log twice; derive once. The purity claim rests on
+    // the fold being a total pure function of the log (no client reference to
+    // call) — proven mechanically by the import-surface audit below and by the
+    // identical-digest assertions across folds and processes.
     const fresh = new Context()
     await fresh.plugin(SessionStore)
     await fresh.plugin(SessionPersistenceSqlite, { path })
     const events = (await fresh.sessionPersistence.load(sessionId)).events
     const state1 = foldProjection(events, String(sessionId))
-    void armed
     const state2 = foldProjection(events, String(sessionId))
     const derived = await deriveAll(fresh.sessionPersistence, sessionId)
     expect(state2.digest).toBe(state1.digest)
     expect(derived.digest).toBe(state1.digest)
     await fresh.fiber.dispose()
-
-    // Zero-invocation: no activity surface was touched by fold/derive.
-    expect(sentinels).toEqual({
-      modelCall: 0,
-      toolCall: 0,
-      retrievalCall: 0,
-      effectDispatch: 0,
-      approvalPrompt: 0,
-      identityMint: 0,
-    })
   })
 
   it('the fold module imports no activity/nondeterminism clients', async () => {
@@ -125,7 +97,7 @@ describe('P0 replay purity on real DSH backing', () => {
       join(import.meta.dirname, '..', 'src', 'projection.ts'),
       'utf8',
     )
-    const importLines = raw.split('\n').filter((line) => line.trim().startsWith('import '))
+    const importLines = raw.split('\n').filter(line => line.trim().startsWith('import '))
     const imported = importLines.join('\n')
     expect(imported).toContain("from 'node:crypto'")
     // No activity-capable client may be imported.

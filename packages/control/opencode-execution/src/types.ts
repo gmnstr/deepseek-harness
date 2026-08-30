@@ -102,6 +102,17 @@ export interface DerivedEffect {
   readonly receipt?: unknown
   /** The stable machine-readable failure of the last failure, when present. */
   readonly error?: string
+  /**
+   * True when the action has an ORPHANED attempt: an `effect/attempt-started`
+   * was recorded but no terminal event followed it (the worker was killed
+   * between dispatch and outcome, so the external mutation may have committed
+   * and its response was lost). This is the crash-window ambiguity fact — the
+   * attempt must be reconciled (never re-dispatched under a fresh execute()).
+   * `ambiguous` is a DERIVED fact from the canonical log, distinct from the
+   * explicit `commit-unknown` outcome (an orphaned attempt has no
+   * `effect/commit-unknown` event).
+   */
+  readonly ambiguous: boolean
 }
 
 /**

@@ -130,10 +130,34 @@ function foldEffects(
 ): { authorities: ReadonlyMap<ActionId, DerivedAuthority>; effects: ReadonlyMap<ActionId, DerivedEffect> } {
   const authorities = new Map<ActionId, DerivedAuthority>()
   const effects = new Map<ActionId, DerivedEffect>()
+  // Per-action set of attempt ids that reached a terminal event
+  // (effect/succeeded | effect/failed | effect/commit-unknown | effect/reconciled).
+  const terminalAttempts = new Map<ActionId, Set<string>>()
 
   function update(actionId: ActionId, patch: (current: DerivedEffect | undefined) => DerivedEffect | undefined): void {
     const next = patch(effects.get(actionId))
     if (next !== undefined) effects.set(actionId, next)
+  }
+
+  // Recompute the derived `ambiguous` flag for an action from the canonical
+  // terminal-attempt coverage. An action is ambiguous when (a) its resolved
+  // outcome is an explicit `effect/commit-unknown` (request sent, external may
+  // have committed, response lost), or (b) its outcome is still in-flight and
+  // its LAST recorded attempt has no terminal event — the crash-window fact
+  // that a worker was killed between dispatch and outcome, leaving the external
+  // mutation's fate unknown. Once a terminal event resolves the action
+  // (succeeded/reconciled/failed/denied), the ambiguity clears. `ambiguous` is
+  // DERIVED from the canonical log, never an event.
+  function deriveAmbiguous(effect: DerivedEffect | undefined): boolean {
+    if (effect === undefined) return false
+    if (effect.outcome === 'succeeded' || effect.outcome === 'reconciled'
+      || effect.outcome === 'failed' || effect.outcome === 'denied') {
+      return false
+    }
+    if (effect.outcome === 'commit-unknown') return true
+    const covered = terminalAttempts.get(effect.action_id) ?? new Set<string>()
+    const lastAttempt = effect.attempt_ids.at(-1)
+    return lastAttempt !== undefined && !covered.has(String(lastAttempt))
   }
 
   for (const event of events) {
@@ -153,6 +177,7 @@ function foldEffects(
           effect_class: payload.effect_class,
           outcome: 'requested',
           attempt_ids: [],
+          ambiguous: false,
         })
         break
       }
@@ -164,7 +189,11 @@ function foldEffects(
           authorized: true,
           capability_id: payload.capability_id,
         })
-        update(payload.action_id, current => current === undefined ? current : { ...current, outcome: 'authorized', capability_id: payload.capability_id })
+        update(payload.action_id, (current) => {
+          if (current === undefined) return current
+          const next = { ...current, outcome: 'authorized' as const, capability_id: payload.capability_id }
+          return { ...next, ambiguous: deriveAmbiguous(next) }
+        })
         break
       }
       case 'effect/denied': {
@@ -175,12 +204,12 @@ function foldEffects(
           authorized: false,
           reason: payload.reason,
         })
-        update(payload.action_id, current => current === undefined ? current : { ...current, outcome: 'denied', reason: payload.reason })
+        update(payload.action_id, current => current === undefined ? current : { ...current, outcome: 'denied', reason: payload.reason, ambiguous: false })
         break
       }
       case 'effect/attempt-started': {
         const payload = event.data as SessionEventMap['effect/attempt-started']
-        update(payload.action_id, current => {
+        update(payload.action_id, (current) => {
           if (current === undefined) return current
           // `commit-unknown` is sticky for the OUTCOME: an ambiguous
           // irreversible effect awaits reconciliation, so a reconcile probe's
@@ -191,36 +220,49 @@ function foldEffects(
           // `act:1:reconcile:1`) is a canonical fact that later terminal
           // events (failEffect/succeedEffect/commitUnknown) reference via
           // requireAttemptStarted.
-          const outcome = current.outcome === 'succeeded' || current.outcome === 'reconciled'
+          const outcome: DerivedEffect['outcome'] = current.outcome === 'succeeded' || current.outcome === 'reconciled'
             ? current.outcome
             : current.outcome === 'commit-unknown'
               ? 'commit-unknown'
               : 'attempt-started'
-          return { ...current, outcome, attempt_ids: [...current.attempt_ids, payload.attempt_id] }
+          const next = { ...current, outcome, attempt_ids: [...current.attempt_ids, payload.attempt_id] }
+          return { ...next, ambiguous: deriveAmbiguous(next) }
         })
         break
       }
-      case 'effect/succeeded': {
-        const payload = event.data as SessionEventMap['effect/succeeded']
-        update(payload.action_id, current => current === undefined ? current : { ...current, outcome: 'succeeded', receipt: payload.receipt })
-        break
-      }
-      case 'effect/failed': {
-        const payload = event.data as SessionEventMap['effect/failed']
-        update(payload.action_id, current => current === undefined ? current : { ...current, outcome: 'failed', error: payload.error })
+      case 'effect/succeeded':
+      case 'effect/failed':
+      case 'effect/reconciled': {
+        const payload = event.data as SessionEventMap['effect/succeeded'] & SessionEventMap['effect/failed'] & SessionEventMap['effect/reconciled']
+        const covered = terminalAttempts.get(payload.action_id) ?? new Set<string>()
+        covered.add(String(payload.attempt_id))
+        terminalAttempts.set(payload.action_id, covered)
+        // effect/succeeded and effect/failed record their outcome directly;
+        // effect/reconciled records the recovered outcome of an earlier
+        // ambiguous attempt (its probe's attempt-started already appended the
+        // attempt id — see `effect/attempt-started`). In every case the
+        // terminal outcome clears the derived ambiguity.
+        update(payload.action_id, (current) => {
+          if (current === undefined) return current
+          const next = {
+            ...current,
+            outcome: event.type === 'effect/succeeded' ? 'succeeded' as const
+              : event.type === 'effect/failed' ? 'failed' as const
+                : 'reconciled' as const,
+            ...(event.type === 'effect/failed' ? { error: payload.error } : { receipt: payload.receipt }),
+          }
+          return { ...next, ambiguous: deriveAmbiguous(next) }
+        })
         break
       }
       case 'effect/commit-unknown': {
         const payload = event.data as SessionEventMap['effect/commit-unknown']
-        update(payload.action_id, current => current === undefined ? current : { ...current, outcome: 'commit-unknown' })
-        break
-      }
-      case 'effect/reconciled': {
-        const payload = event.data as SessionEventMap['effect/reconciled']
-        // The reconcile probe's attempt-started already appended the attempt id
-        // (see `effect/attempt-started`); this terminal event only resolves the
-        // outcome. Not appending here avoids recording the same attempt twice.
-        update(payload.action_id, current => current === undefined ? current : { ...current, outcome: 'reconciled', receipt: payload.receipt })
+        const covered = terminalAttempts.get(payload.action_id) ?? new Set<string>()
+        covered.add(String(payload.attempt_id))
+        terminalAttempts.set(payload.action_id, covered)
+        // commit-unknown is sticky for the outcome; the ambiguity fact stays
+        // true until a reconcile terminal event resolves the action.
+        update(payload.action_id, current => current === undefined ? current : { ...current, outcome: 'commit-unknown', ambiguous: true })
         break
       }
       default:
