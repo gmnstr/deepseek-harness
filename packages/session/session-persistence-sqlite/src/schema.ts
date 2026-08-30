@@ -15,7 +15,7 @@ import {
 import { sql } from './sql.ts'
 
 /** Current physical-record schema with packed and compressed event rows. */
-export const SCHEMA_VERSION = 19
+export const SCHEMA_VERSION = 20
 /** Application id reserved for DeepSeek Harness SQLite session databases. */
 export const SESSION_PERSISTENCE_SQLITE_APPLICATION_ID = 0x44534850
 
@@ -32,6 +32,7 @@ export interface SessionRow {
   readonly revision: number
   readonly delegation_depth: number | null
   readonly agent_preset: string | null
+  readonly ownership_epoch: number
 }
 
 /** One physical event row; packed rows may represent multiple logical events. */
@@ -207,7 +208,7 @@ function initializeDatabase(db: DatabaseSync): void {
   db.exec(sql('schema'))
   db.prepare(sql('insert-persistence-state')).run(randomUUID())
   db.exec(sql('set-application-id'))
-  db.exec(sql('set-user-version-19'))
+  db.exec(sql('set-user-version-20'))
 }
 
 let canonicalSchema: readonly SchemaObjectRow[] | undefined
@@ -304,6 +305,7 @@ export function decodeSessionRow(value: unknown): SessionRow {
     agent_preset: nullableStringField(row, 'agent_preset'),
     incarnation,
     revision: nonnegativeSafeIntegerField(row, 'revision'),
+    ownership_epoch: nonnegativeSafeIntegerField(row, 'ownership_epoch'),
   }
 }
 

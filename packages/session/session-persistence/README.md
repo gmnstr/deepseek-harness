@@ -45,6 +45,10 @@ const headers = await ctx.sessionPersistence.list()        // every stored sessi
 
 `append` resolves only after the batch is durable, so a resolved write survives an OS crash or power loss. Ordinary `create` remains lazy; a lifecycle frontend calls `ensureMaterialized` only when an empty session must itself appear in durable listing without inventing an event. `load` returns an immutable balanced log and commits any needed crash recovery; `inspect` reads the same view without committing recovery. Consumers that resume from a watermark can read only the events at or past a sequence number, and a session's artifact location (`locate`) resolves without filesystem I/O.
 
+### Fenced appends and ownership epochs
+
+Multi-process writers must not be able to append a stale process's events to a session another process has taken over. Each backend declares its reality through `ownershipSupport`: `FENCING_SUPPORTED` (SQLite), `UNSUPPORTED_FAIL_CLOSED` (JSONL — the fenced form is rejected, never silently dropped), or `NOT_PRODUCTION_CAPABLE_FOR_MULTI_WRITER`. A fencing backend exposes `appendFenced(id, events, { worker_id, ownership_epoch })`, which runs the same validation and serialization as `append` and passes the durable epoch into the backend's append transaction, so a stale epoch rejects before any event commits. Ownership migrates through the backend's epoch CAS; the unfenced `append` stays available for legacy and repair paths.
+
 ### Resuming and crash recovery
 
 Resume is `load` plus session preparation: the stored log comes back with its header lineage intact, so a resumed agent sees the same history and composition. A session that crashed mid-turn reloads with its interrupted final turn preserved and balanced: `load` appends synthetic `tool/result` and `turn/end {interrupted}` closers for unanswered calls instead of dropping the events — a single turn can be large, and those events were durably written before the crash. Only a never-fully-written torn tail fragment is discarded.
@@ -73,6 +77,7 @@ The package is the Service Definition of a capability seam with two halves. The 
 - **Contiguous `seq`.** A gap in the middle of the log rejects; `append`'s first `seq` must equal the stored next-seq.
 - **Lossless JSON data.** Batches pass the shared one-pass lossless-JSON boundary; non-serializable payloads reject at the append site.
 - **Durability.** `append` resolves only once the batch is durable.
+- **Fences are declared, never assumed.** A backend that cannot fence fails the fenced-append form closed rather than pretending the epoch was honored.
 
 ### Source map
 

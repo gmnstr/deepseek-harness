@@ -157,6 +157,19 @@ export class SqliteStore implements PersistenceBackend<number> {
     return row === undefined ? undefined : sqliteRevision(this.storeIdentity, row)
   }
 
+  /**
+   * Read the stored session's durable ownership epoch.
+   * @param id - persisted session id to read.
+   * @param signal - optional cancellation for backend read work.
+   * @returns the stored epoch, or `undefined` when the identity is absent.
+   */
+  async ownershipEpochOf(id: SessionId, signal?: AbortSignal): Promise<number | undefined> {
+    await this.observe(signal)
+    const row = this.rowFor(id)
+    signal?.throwIfAborted()
+    return row?.ownership_epoch
+  }
+
   async loadStoredFrom(id: SessionId, fromSeq: number, signal?: AbortSignal): Promise<StoredSuffix | undefined> {
     await this.observe(signal)
     const snapshot = this.readTransaction(() => {
@@ -174,6 +187,7 @@ export class SqliteStore implements PersistenceBackend<number> {
     meta: SessionHeader,
     events: readonly SessionEvent[],
     isMaterialized: boolean,
+    writerEpoch?: number,
   ): Promise<void> {
     await this.open()
     if (events.length === 0) return
@@ -181,6 +195,7 @@ export class SqliteStore implements PersistenceBackend<number> {
     try {
       validateSchemaForMutation(this.databaseConstructor, this.db, this.databasePath)
       const sessionKey = isMaterialized ? this.sessionKey(meta.id) : this.writeRow(meta)
+      this.assertEpoch(meta.id, writerEpoch)
       const tailRows = this.tailRows(sessionKey)
       const currentLast = this.logicalLastEvent(meta.id, tailRows)
       const expected = currentLast === undefined ? 0 : currentLast.seq + 1
@@ -211,16 +226,49 @@ export class SqliteStore implements PersistenceBackend<number> {
     }
   }
 
+  /**
+   * Advance a session's durable ownership epoch with an atomic compare-and-swap:
+   * the stored epoch must equal `fromEpoch`. `false` means the stored epoch
+   * already moved past `fromEpoch` — the caller lost ownership and must not
+   * write. Never throws on a stale epoch.
+   * @param id - persisted session whose epoch is advanced.
+   * @param fromEpoch - epoch the caller currently owns.
+   * @param toEpoch - strictly greater epoch the caller claims.
+   * @returns true when the CAS advanced the epoch, false when the stored epoch
+   *   is no longer `fromEpoch`.
+   */
+  async advanceOwnershipEpoch(id: SessionId, fromEpoch: number, toEpoch: number): Promise<boolean> {
+    await this.open()
+    if (!Number.isSafeInteger(fromEpoch) || fromEpoch < 0) {
+      throw new TypeError('fromEpoch must be a non-negative safe integer')
+    }
+    if (!Number.isSafeInteger(toEpoch) || toEpoch <= fromEpoch) {
+      throw new TypeError('toEpoch must be a safe integer strictly greater than fromEpoch')
+    }
+    this.db.exec(sql('begin-immediate'))
+    try {
+      validateSchemaForMutation(this.databaseConstructor, this.db, this.databasePath)
+      const changed = this.db.prepare(sql('update-session-epoch'))
+        .run(toEpoch, id, fromEpoch)
+      this.db.exec(sql('commit'))
+      return Number(changed.changes) === 1
+    } catch (error: unknown) {
+      this.rollback(error, 'advance ownership epoch')
+    }
+  }
+
   async commitRepair(
     meta: SessionHeader,
     tornMarker: number | undefined,
     closers: readonly SessionEvent[],
+    writerEpoch?: number,
   ): Promise<void> {
     await this.open()
     if (tornMarker === undefined && closers.length === 0) return
     this.db.exec(sql('begin-immediate'))
     try {
       validateSchemaForMutation(this.databaseConstructor, this.db, this.databasePath)
+      this.assertEpoch(meta.id, writerEpoch)
       const row = this.rowFor(meta.id)
       if (row === undefined) throw new Error(`session ${meta.id} metadata row is missing`)
       const sessionKey = this.sessionKey(meta.id)
@@ -288,6 +336,23 @@ export class SqliteStore implements PersistenceBackend<number> {
   private rowFor(id: SessionId): SessionRow | undefined {
     const value = this.db.prepare(sql('select-session')).get(id)
     return value === undefined ? undefined : decodeSessionRow(value)
+  }
+
+  /**
+   * Reject a fenced append whose writer does not own the current epoch. Runs
+   * after the upsert so a first write's fresh row defaults to epoch 0, which a
+   * writer supplying epoch 0 owns. An unfenced append (no epoch) never fences.
+   */
+  private assertEpoch(id: SessionId, writerEpoch: number | undefined): void {
+    if (writerEpoch === undefined) return
+    if (!Number.isSafeInteger(writerEpoch) || writerEpoch < 0) {
+      throw new TypeError('writerEpoch must be a non-negative safe integer')
+    }
+    const row = this.rowFor(id)
+    if (row === undefined) throw new Error(`session ${id} metadata row is missing`)
+    if (row.ownership_epoch !== writerEpoch) {
+      throw new SessionOwnershipFencedError(id, row.ownership_epoch, writerEpoch)
+    }
   }
 
   private sessionKey(id: SessionId): number {
@@ -408,6 +473,23 @@ function sqliteRevision(storeIdentity: string, row: SessionRow): PersistenceRevi
   return SessionPersistenceRevision(
     `${storeIdentity}:incarnation:${row.incarnation}:revision:${row.revision}`,
   )
+}
+
+/**
+ * A fenced append was rejected because the writer's epoch is stale: the stored
+ * session belongs to a newer ownership epoch, so the writer must migrate
+ * through {@link SqliteStore.advanceOwnershipEpoch} (a CAS) or yield.
+ */
+export class SessionOwnershipFencedError extends Error {
+  /**
+   * @param id - persisted session whose epoch rejected the writer.
+   * @param storedEpoch - the durable ownership epoch that won the fence.
+   * @param writerEpoch - the stale epoch the rejected writer supplied.
+   */
+  constructor(readonly id: SessionId, readonly storedEpoch: number, readonly writerEpoch: number) {
+    super(`session "${id}" is owned by epoch ${storedEpoch}, but writer holds epoch ${writerEpoch}`)
+    this.name = 'SessionOwnershipFencedError'
+  }
 }
 
 async function createDatabaseFile(path: string): Promise<void> {

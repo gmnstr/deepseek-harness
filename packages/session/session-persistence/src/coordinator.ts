@@ -17,7 +17,7 @@ import {
 } from '@deepseek-ai/dsh-session'
 import type { Session, SessionEvent, SessionId, SessionHeader } from '@deepseek-ai/dsh-session'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
-import type { BorrowedSessionSource, SessionInspection, SessionLocation } from './index.ts'
+import type { BorrowedSessionSource, SessionInspection, SessionLocation, WriterEpochToken } from './index.ts'
 import { SessionPersistenceNotFoundError } from './errors.ts'
 import type { SessionPersistenceRevision } from './revision.ts'
 import { observeQueuedAbort, SessionPreparations } from './preparations.ts'
@@ -152,6 +152,16 @@ export interface PersistenceBackend<TornMarker = unknown> {
   readStoredRevision(id: SessionId, signal?: AbortSignal): Promise<SessionPersistenceRevision | undefined>
 
   /**
+   * Optional durable ownership-epoch read for the coordinator's fence bookkeeping.
+   * A fencing backend implements this so adopted state carries the stored epoch;
+   * a backend without a durable epoch omits it and the coordinator treats the
+   * session as epoch-less (fenced appends still fail closed at the backend).
+   * @param id - persisted session id to read.
+   * @returns the stored ownership epoch, or `undefined` when the identity is absent.
+   */
+  ownershipEpochOf?(id: SessionId): Promise<number | undefined>
+
+  /**
    * Optional seek-capable suffix read behind the service's `readFrom`: return
    * the header plus the stored events with `seq >= fromSeq` without reading
    * the whole log. A backend whose medium can address events by seq (SQLite)
@@ -183,8 +193,18 @@ export interface PersistenceBackend<TornMarker = unknown> {
    * when `!isMaterialized`. The materialize-write and the first event batch MUST
    * commit ATOMICALLY (a crash between them must not leave a materialized-but-
    * empty session). Returns once the batch is durable.
+   *
+   * `writerEpoch` is the optional fence token: when supplied, the backend must
+   * verify the stored session's durable ownership epoch equals it and reject a
+   * stale writer (backends that cannot fence must REJECT the epoch form, never
+   * ignore it). An undefined epoch is the legacy unfenced append.
    */
-  appendBatch(meta: SessionHeader, events: readonly SessionEvent[], isMaterialized: boolean): Promise<void>
+  appendBatch(
+    meta: SessionHeader,
+    events: readonly SessionEvent[],
+    isMaterialized: boolean,
+    writerEpoch?: number,
+  ): Promise<void>
 
   /**
    * Make a crash repair durable: truncate the torn tail (iff
@@ -192,8 +212,19 @@ export interface PersistenceBackend<TornMarker = unknown> {
    * be atomic — a file backend may truncate-then-append in two fsync'd steps.
    * Used by load (truncate + synthetic closers) and by live-adoption (truncate
    * only, `closers = []`).
+   *
+   * `writerEpoch` is the optional fence token: when supplied, the backend must
+   * verify the stored session's durable ownership epoch equals it and reject a
+   * stale writer before deleting or appending anything (backends that cannot
+   * fence must REJECT the epoch form, never ignore it). An undefined epoch is
+   * the legacy unfenced repair.
    */
-  commitRepair(meta: SessionHeader, tornMarker: TornMarker | undefined, closers: readonly SessionEvent[]): Promise<void>
+  commitRepair(
+    meta: SessionHeader,
+    tornMarker: TornMarker | undefined,
+    closers: readonly SessionEvent[],
+    writerEpoch?: number,
+  ): Promise<void>
 
   /**
    * List all stored (materialized) sessions' metadata.
@@ -228,6 +259,13 @@ interface SessionState {
    * distinguish an unused id from a persisted collision.
    */
   materialized: boolean
+  /**
+   * The durable ownership epoch this runtime holds for the session, when the
+   * backend fences writers. `undefined` means the backend exposes no durable
+   * epoch (and fenced appends fail closed at the backend). Initialized from the
+   * backend on adoption and updated after an epoch migration.
+   */
+  ownershipEpoch: number | undefined
   /**
    * The live Session this state was bound to via `onCreated`, if any. State
    * created through the public `create()`/`load()` API has no owner; state bound
@@ -677,7 +715,7 @@ export class PersistenceCoordinator<TornMarker = unknown> {
       throw new Error(`session "${meta.id}" already has a persisted log on disk; load/resume it instead of creating`)
     }
     // Pure lazy: record intent only. No artifact until the first append.
-    this.states.set(meta.id, { meta, cursor: 0, materialized: false })
+    this.states.set(meta.id, { meta, cursor: 0, materialized: false, ownershipEpoch: undefined })
   }
 
   // `async` so synchronous materialization failures below reject (not throw) per
@@ -702,7 +740,40 @@ export class PersistenceCoordinator<TornMarker = unknown> {
     return this.serialize(id, () => this.appendCore(id, batch))
   }
 
-  private async appendCore(id: SessionId, events: readonly SessionEvent[]): Promise<void> {
+  /**
+   * Durably persist a batch as a writer that claims a durable ownership epoch.
+   * Runs the same validation, batching, and per-session serialization as
+   * {@link append}, then passes the epoch through to the backend so a stale
+   * writer (one whose epoch no longer matches the stored session) is rejected
+   * before any event row commits. The backend must refuse this form when it
+   * cannot fence.
+   * @param id - the session the batch belongs to.
+   * @param events - the contiguous batch to persist, in seq order.
+   * @param writer - the writer's durable ownership token.
+   */
+  async appendFenced(
+    id: SessionId,
+    events: readonly SessionEvent[],
+    writer: WriterEpochToken,
+  ): Promise<void> {
+    if (!Number.isSafeInteger(writer.ownership_epoch) || writer.ownership_epoch < 0) {
+      throw new TypeError('writer ownership_epoch must be a non-negative safe integer')
+    }
+    if (typeof writer.worker_id !== 'string' || writer.worker_id.length === 0) {
+      throw new TypeError('writer worker_id must be a non-empty string')
+    }
+    const batch = snapshotJsonValue(events)
+    if (batch === undefined) {
+      throw new TypeError('session event batch is not losslessly JSON-serializable because it contains non-JSON-serializable data')
+    }
+    return this.serialize(id, () => this.appendCore(id, batch, writer.ownership_epoch))
+  }
+
+  private async appendCore(
+    id: SessionId,
+    events: readonly SessionEvent[],
+    writerEpoch?: number,
+  ): Promise<void> {
     // Every append route converges here: the public service, live write-behind
     // drains, and HMR seed/suffix adoption. Legacy-shape rejection stays at
     // this shared boundary so a stale JavaScript plugin cannot persist a
@@ -724,11 +795,12 @@ export class PersistenceCoordinator<TornMarker = unknown> {
       }
     }
 
-    await this.backend.appendBatch(state.meta, events, state.materialized)
+    await this.backend.appendBatch(state.meta, events, state.materialized, writerEpoch)
     // The durable write is the transaction: mark materialized + advance the
     // cursor as soon as it commits (uniform across backends).
     state.materialized = true
     state.cursor += events.length
+    if (writerEpoch !== undefined) state.ownershipEpoch = writerEpoch
     this.preparations.invalidate(id)
   }
 
@@ -1023,7 +1095,17 @@ export class PersistenceCoordinator<TornMarker = unknown> {
     }
     if (!await this.isPreparedSourceCurrent(source)) return undefined
     if (source.tornMarker !== undefined || source.closers.length > 0) {
-      await this.backend.commitRepair(source.inspection.meta, source.tornMarker, source.closers)
+      // Repair is part of taking ownership: pass the STORED epoch (read fresh)
+      // as the fence token so a stale process whose epoch was superseded by a
+      // CAS cannot mutate a session another process now owns. The store checks
+      // stored epoch === writerEpoch inside the transaction, so the repair only
+      // proceeds when the stored epoch is unchanged since this read.
+      await this.backend.commitRepair(
+        source.inspection.meta,
+        source.tornMarker,
+        source.closers,
+        await this.readOwnershipEpoch(source),
+      )
       // The repair changed the durable revision. Reload the exact committed
       // graph instead of associating the old in-memory view with a newer revision.
       return undefined
@@ -1032,6 +1114,7 @@ export class PersistenceCoordinator<TornMarker = unknown> {
       meta: source.inspection.meta,
       cursor,
       materialized: true,
+      ownershipEpoch: await this.readOwnershipEpoch(source),
     }
     state.meta = source.inspection.meta
     state.cursor = cursor
@@ -1041,6 +1124,13 @@ export class PersistenceCoordinator<TornMarker = unknown> {
       source,
       state,
     }
+  }
+
+  /** Read the stored session's durable ownership epoch when the backend fences. */
+  private async readOwnershipEpoch(source: PreparedSessionSource<TornMarker>): Promise<number | undefined> {
+    if (this.backend.ownershipEpochOf === undefined) return undefined
+    const epoch = await this.backend.ownershipEpochOf(source.inspection.meta.id)
+    return epoch === undefined ? 0 : epoch
   }
 
   /** Whether one cached source still names the current durable log revision. */
@@ -1389,15 +1479,29 @@ export class PersistenceCoordinator<TornMarker = unknown> {
       throw new Error(`session "${session.header.id}" already has a persisted log on disk that does not match this live session (id collision)`)
     }
     // Truncate-only repair (no closers): the open turn is NOT closed here.
-    if (tornMarker !== undefined) await this.backend.commitRepair(meta, tornMarker, [])
+    // Pass the stored epoch (read fresh) as the fence token so a stale process
+    // whose epoch was superseded by a CAS cannot truncate a tail on a session it
+    // no longer owns. The store checks stored epoch === writerEpoch inside the
+    // transaction, so truncation only proceeds when the epoch is unchanged.
+    if (tornMarker !== undefined) {
+      await this.backend.commitRepair(meta, tornMarker, [], await this.adoptedEpoch(session.header.id))
+    }
     this.states.set(session.header.id, {
       meta: { ...meta },
       cursor: storedEvents.length,
       materialized: true,
+      ownershipEpoch: await this.adoptedEpoch(session.header.id),
       owner: session,
     })
     const suffix = seed.slice(storedEvents.length)
     if (suffix.length > 0) await this.appendCore(session.header.id, suffix)
+  }
+
+  /** Resolve a session's durable ownership epoch after HMR adoption. */
+  private async adoptedEpoch(id: SessionId): Promise<number | undefined> {
+    if (this.backend.ownershipEpochOf === undefined) return undefined
+    const epoch = await this.backend.ownershipEpochOf(id)
+    return epoch === undefined ? 0 : epoch
   }
 
   private async flush(session: Session): Promise<void> {

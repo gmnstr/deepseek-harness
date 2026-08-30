@@ -15,7 +15,8 @@ CREATE TABLE sessions (
   delegation_depth INTEGER,
   agent_preset     TEXT,
   incarnation      TEXT NOT NULL,
-  revision         INTEGER NOT NULL
+  revision         INTEGER NOT NULL,
+  ownership_epoch  INTEGER NOT NULL DEFAULT 0
 ) STRICT;
 
 CREATE TABLE events (

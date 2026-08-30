@@ -69,6 +69,7 @@ interface CoordinatorInternals {
  */
 class MemoryPersistence extends SessionPersistence implements PersistenceBackend<never> {
   override readonly supportsRawArtifacts = false
+  override readonly ownershipSupport: SessionPersistence['ownershipSupport'] = 'UNSUPPORTED_FAIL_CLOSED'
 
   static inject = ['sessions']
 

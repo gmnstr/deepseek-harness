@@ -23,6 +23,27 @@ export interface SessionPersistenceSnapshot {
   revision: SessionPersistenceRevision
 }
 
+/**
+ * How a backend fences stale writers across processes and epochs. Backends that
+ * lack a durable ownership primitive must say so: fenced appends fail closed,
+ * never pretend to fence.
+ */
+export type OwnershipSupport =
+  | 'FENCING_SUPPORTED'
+  | 'UNSUPPORTED_FAIL_CLOSED'
+  | 'NOT_PRODUCTION_CAPABLE_FOR_MULTI_WRITER'
+
+/**
+ * The writer-owned token a fenced append carries. The epoch is durable per
+ * session; the worker id names the writer for diagnostics.
+ */
+export interface WriterEpochToken {
+  /** Identity of the worker process that owns the epoch. */
+  readonly worker_id: string
+  /** The durable ownership epoch the writer claims for the session. */
+  readonly ownership_epoch: number
+}
+
 /** Immutable logical session prepared from persistence or a live owner. */
 export interface SessionInspection {
   /** Validated immutable session metadata. */
@@ -77,7 +98,6 @@ export type {
   StoredPrefix,
   StoredSuffix,
 } from './coordinator.ts'
-
 declare module '@deepseek-ai/cordis' {
   interface Context {
     sessionPersistence: SessionPersistence
@@ -121,6 +141,19 @@ export abstract class SessionPersistence extends Service {
    * A backend that declares `true` must override {@link readRaw}.
    */
   abstract readonly supportsRawArtifacts: boolean
+
+  /**
+   * How this backend fences stale writers. A backend declaring
+   * {@link OwnershipSupport.FENCING_SUPPORTED} enforces the durable
+   * ownership epoch inside its append transaction and rejects stale writers;
+   * {@link appendFenced} then carries real fence guarantees. A backend
+   * declaring `UNSUPPORTED_FAIL_CLOSED` must REJECT the fenced-append form
+   * rather than silently drop the epoch; callers must not use
+   * {@link appendFenced} against it. `NOT_PRODUCTION_CAPABLE_FOR_MULTI_WRITER`
+   * declares a backend whose storage cannot fence at all and is unsafe for
+   * more than one writer process.
+   */
+  abstract readonly ownershipSupport: OwnershipSupport
 
   /**
    * Read a session's backend-owned artifact text verbatim — the exact durable
@@ -172,6 +205,29 @@ export abstract class SessionPersistence extends Service {
    * @param events - the contiguous batch to persist, in seq order.
    */
   abstract append(id: SessionId, events: readonly SessionEvent[]): Promise<void>
+
+  /**
+   * Durably persist a batch as a writer that claims a durable ownership epoch.
+   * Equivalent to {@link append} plus the fence: the backend rejects the batch
+   * when the stored session belongs to a NEWER epoch than the writer holds
+   * (for backends declaring {@link OwnershipSupport.FENCING_SUPPORTED}) or
+   * rejects the fenced form itself (for backends declaring
+   * `UNSUPPORTED_FAIL_CLOSED`). Backends that cannot fence must not silently
+   * ignore the epoch. The default refuses the fenced form so an unfenced
+   * backend fails closed; a fencing backend overrides it.
+   * @param _id - the session the batch belongs to (unused by the default: the
+   * fenced form is refused outright).
+   * @param _events - the contiguous batch to persist, in seq order (unused by
+   * the default: the fenced form is refused outright).
+   * @param _writer - the writer's durable ownership token (unused by the
+   * default: the fenced form is refused outright).
+   */
+  appendFenced(_id: SessionId, _events: readonly SessionEvent[], _writer: WriterEpochToken): Promise<void> {
+    return Promise.reject(new Error(
+      `this session persistence backend (ownershipSupport=${this.ownershipSupport}) does not support fenced appends; ` +
+      'refusing to silently ignore the writer ownership epoch',
+    ))
+  }
 
   /**
    * Prepare the exact unpublished Session used by resume. Implementations may

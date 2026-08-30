@@ -148,6 +148,7 @@ These limits define when this backend is a poor fit or needs special operational
 - **Compressed files are not directly line-readable** — use the backend to load them, or select `compression: 'none'` before writing a fresh root when external line readers are required.
 - **Nothing deletes session files** — logs accumulate under `root` until removed externally; the seam has no deletion API.
 - **One live writer per session** — append and repair are coordinated only inside the owning backend instance; another instance or process must not write the same session until that owner reaches quiescent disposal.
+- **No stale-writer fencing** — the backend declares `ownershipSupport: 'UNSUPPORTED_FAIL_CLOSED'`: a fenced append (`appendFenced`) is REJECTED rather than silently dropping the ownership epoch, because the file layout has no durable epoch primitive.
 - **POSIX materialization requires hard-link support** — first append uses `link()` so same-id races fail instead of overwriting a committed log; Windows uses write-through rename without replacement.
 
 <a id="dev-note"></a>

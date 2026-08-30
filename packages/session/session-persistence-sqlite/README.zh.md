@@ -33,7 +33,7 @@ kind: "package-reference"
 
 ### 磁盘占用与性能
 
-打包布局以部分 SQLite 本地延迟换取更小的可查询数据库。在 501 会话对比语料上，schema-19 布局占用 233.18 MB，SQLite 对比基线占用 438.31 MB，压缩 JSONL 占用 148.15 MB。全量写入约比 JSONL 快 2.3 倍，后缀读取也仍快得多；完整读取与 fork 则略慢于 JSONL。方法、完整指标与取舍由[持久化延迟与 page size 决策](../../../.agents/notes/implemented/architecture/2026-08-25-persistence-latency-and-page-size.zh.md)记录。
+打包布局以部分 SQLite 本地延迟换取更小的可查询数据库。在 501 会话对比语料上，schema-19 布局占用 233.18 MB，SQLite 对比基线占用 438.31 MB，压缩 JSONL 占用 148.15 MB。全量写入约比 JSONL 快 2.3 倍，后缀读取也仍快得多；完整读取与 fork 则略慢于 JSONL。方法、完整指标与取舍由[持久化延迟与 page size 决策](../../../.agents/notes/implemented/architecture/2026-08-25-persistence-latency-and-page-size.zh.md)记录。Schema 20 保留该打包布局，并新增支撑持久化陈旧写入方隔离的每会话 `ownership_epoch` 列。
 
 磁盘成本换来的是结构化、可查询的会话历史视图：外部工具可以用 SQL 分析 `sessions` 与 `events`，按本提供方的方式解码物理行——这是内置全文搜索等功能的天然基础。
 
@@ -75,7 +75,7 @@ await ctx.sessionPersistence.append(id, events)
 
 ### 启动与安全运行
 
-全新数据库直接初始化为 schema 版本 19，并使用 64 KiB page。已有文件不会被重新调参：任何其他版本、外来应用标识、无版本的非全新 schema 或意外 schema 对象，都会在任何数据暴露或变更之前被拒绝。本预发布提供方不提供迁移。每条语句和固定 pragma 都来自 `resources/sql/` 下打包的 `.sql` 资源，运行时的值以 SQLite 参数绑定，包代码从不拼装查询文本。
+全新数据库直接初始化为 schema 版本 20，并使用 64 KiB page。已有文件不会被重新调参：任何其他版本、外来应用标识、无版本的非全新 schema 或意外 schema 对象，都会在任何数据暴露或变更之前被拒绝。本预发布提供方不提供迁移。每条语句和固定 pragma 都来自 `resources/sql/` 下打包的 `.sql` 资源，运行时的值以 SQLite 参数绑定，包代码从不拼装查询文本。
 
 每个连接都会禁用 SQLite trusted schema 与内存映射 I/O、验证所请求的 journal mode，并固定 `synchronous=FULL`，保证成功返回的追加在操作系统崩溃或断电后依然持久。在 POSIX 上，数据库父目录和文件必须属于当前用户，父目录不得允许组或其他用户写入，文件也不得授予任何组或其他用户权限；Windows 还会拒绝符号链接和非普通文件，ACL 限制则由部署方负责。路径与所有权失败会拒绝插件初始化；Node 的 SQLite 驱动在首次持久化操作时才延迟加载。普通 `create` 会保持惰性直到首次 append，而 `ensureMaterialized` 会写入一条没有事件行的会话元数据记录。
 
@@ -94,9 +94,10 @@ await ctx.sessionPersistence.append(id, events)
 本提供方建立在一个分离与三项承诺之上：
 
 - **逻辑约定，物理格式。** 调用方始终读写普通的 `SessionEvent[]`；行如何打包、存储与压缩是本包私有的存储行为。
-- **schema 拥有格式。** Schema 19 是冻结的物理约定：任何其他版本、外来标识或意外 schema 对象的数据库都会被拒绝，绝不迁移。改变 schema、行 codec、page size 或字典字节都需要新的 schema 版本。
+- **schema 拥有格式。** Schema 20 是冻结的物理约定：任何其他版本、外来标识或意外 schema 对象的数据库都会被拒绝，绝不迁移。改变 schema、行 codec、page size 或字典字节都需要新的 schema 版本。
 - **持久性是默认值。** 追加在立即事务中以 `synchronous=FULL` 提交，成功返回的 `append()` 意味着该批次已持久。普通追加仅插入：更早的事件行永远不会被重写。
 - **在严格边界内追求效率。** 打包与压缩让数据库保持小巧，但每个上限都是硬性格式边界——每个打包行至多表示 1,024 个事件、1 MiB 载荷。
+- **陈旧写入方被隔离而非过滤。** 受隔离的追加携带持久化的所有权纪元；存储层在立即事务内校验它，并在任何事件行提交前拒绝陈旧写入方。纪元位于 `sessions` 表，因此跨进程依然持久；所有权只能通过原子比较并交换迁移。
 
 打包行基础由 [SQLite 物理分片行决策](../../../.agents/notes/implemented/architecture/2026-08-18-sqlite-physical-chunk-row-compression.zh.md)记录；当前压缩、键和 page-size 选择由[持久化延迟与 page size 决策](../../../.agents/notes/implemented/architecture/2026-08-25-persistence-latency-and-page-size.zh.md)记录。
 
@@ -119,14 +120,14 @@ await ctx.sessionPersistence.append(id, events)
 | 表 | 用途 |
 |---|---|
 | `persistence_state` | 单行存储标识 |
-| `sessions` | 每个会话一行：头部字段加单调递增的 revision |
+| `sessions` | 每个会话一行：头部字段、单调递增的 revision 与持久化的所有权纪元 |
 | `events` | 物理事件行：一个逻辑事件，或一个打包连续段 |
 
 确切的列定义见 [`resources/sql/schema.sql`](resources/sql/schema.sql)。`sessions.id` 是内部整数键，`sessions.session_key` 保留公开会话 id。`events.data` 存放文本或可独立解码的 Zstandard blob；仅在结果更小时才使用 schema 自有的共享字典压缩。`events.source_event_seqs` 使用带 tag 的 delta 或 run 编码。标量逻辑事件的 `events.is_packed` 为 `0`，打包分片连续段的该值为 `1`，因此类型与物理分片标签同名的标量事件仍然明确。打包行沿用其首个逻辑事件的 `seq`，因此在复合主键 `(session_id, seq)` 下，物理顺序就是逻辑顺序。
 
-### 写入路径
+### 写入路径与陈旧写入方隔离
 
-每次追加都会开启立即事务、重新验证 schema 归属、检查已存尾部以防止陈旧写入方扩展日志、只打包新批次、插入对应行、递增一次会话 revision，然后提交。协调器按配置窗口聚合实时事件，因此高频流会产生更大的打包行，而物理写入量始终与新持久批次成正比。
+每次追加都会开启立即事务、重新验证 schema 归属、检查已存尾部以防止陈旧写入方扩展日志、只打包新批次、插入对应行、递增一次会话 revision，然后提交。受隔离的追加会在同一事务内额外校验 `sessions.ownership_epoch === writerEpoch`，并在任何事件行提交前对持有旧纪元的陈旧写入方抛出 `SessionOwnershipFencedError`。所有权只能通过 `advanceOwnershipEpoch(id, from, to)` 迁移——它原子地执行 `UPDATE sessions SET ownership_epoch = ? WHERE session_key = ? AND ownership_epoch = ?`，并报告恰好一行是否被更新——因此两个进程竞争认领会话时不可能同时获胜。新插入行的纪元为 `0`，upsert 冲突路径永远不会重置它，因此既有会话的所有权在重新物化与后端重启后依然保留。协调器按配置窗口聚合实时事件，因此高频流会产生更大的打包行，而物理写入量始终与新持久批次成正比。
 
 ### 读取与恢复
 
@@ -173,7 +174,8 @@ await ctx.sessionPersistence.append(id, events)
 
 这些限制说明本提供方何时不合适，或何时需要特别的运维注意。它们是当前包约束，不是通用 SQLite 对比或任务积压。
 
-- **预发布设计，无迁移**——schema 19 是临时的 SQLite 专用设计；不保证 schema 稳定性或迁移支持。
+- **预发布设计，无迁移**——schema 20 是临时的 SQLite 专用设计；不保证 schema 稳定性或迁移支持。
+- **隔离要求协调器传递纪元**——`append`（遗留表面）与实时写后排水保持不受隔离；只有 `appendFenced` 会把持久化纪元传入存储层。混合受隔离与不受隔离写入方的部署，其不受隔离一侧的保护停留在连续性检查，而非隔离。
 - **打包依赖批次边界**——被写后窗口或显式 flush 拆开的兼容连续段仍分属不同物理行；这避免了重写先前行，代价是打包比例依赖时序。
 - **同步 SQLite 与压缩**——Node 的 SQLite 驱动与 Zstandard 调用会阻塞 JavaScript 线程。
 - **忙等待阻塞事件循环**——SQLite 在同步调用内部等待；竞争写入方最长可让线程停顿配置的 `busyTimeoutMs`。

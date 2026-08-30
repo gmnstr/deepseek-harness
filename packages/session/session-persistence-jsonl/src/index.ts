@@ -122,6 +122,7 @@ function isENOENT(error: unknown): boolean {
  */
 export class JsonlSessionPersistence extends SessionPersistence implements PersistenceBackend<JsonlTornMarker> {
   override readonly supportsRawArtifacts = true
+  override readonly ownershipSupport: SessionPersistence['ownershipSupport'] = 'UNSUPPORTED_FAIL_CLOSED'
 
   static inject = ['sessions']
 
@@ -429,7 +430,18 @@ export class JsonlSessionPersistence extends SessionPersistence implements Persi
   }
 
   /** Durably append a batch, lazily materializing the file when not yet present. */
-  async appendBatch(meta: SessionHeader, events: readonly SessionEvent[], isMaterialized: boolean): Promise<void> {
+  async appendBatch(
+    meta: SessionHeader,
+    events: readonly SessionEvent[],
+    isMaterialized: boolean,
+    writerEpoch?: number,
+  ): Promise<void> {
+    if (writerEpoch !== undefined) {
+      throw new Error(
+        'session-persistence-jsonl cannot fence writers: refusing the fenced append form '
+        + `(writer epoch ${writerEpoch} for session "${meta.id}") instead of silently dropping the fence`,
+      )
+    }
     await this.ensureRootEncoding()
     if (isMaterialized) {
       await this.appendLines(meta, events)
@@ -452,7 +464,14 @@ export class JsonlSessionPersistence extends SessionPersistence implements Persi
     meta: SessionHeader,
     tornMarker: JsonlTornMarker | undefined,
     closers: readonly SessionEvent[],
+    writerEpoch?: number,
   ): Promise<void> {
+    if (writerEpoch !== undefined) {
+      throw new Error(
+        'session-persistence-jsonl cannot fence writers: refusing the fenced repair form '
+        + `(writer epoch ${writerEpoch} for session "${meta.id}") instead of silently dropping the fence`,
+      )
+    }
     if (tornMarker !== undefined) await this.repair(meta, tornMarker.truncateTo)
     const repairedEvents = [...(tornMarker?.recoveredEvents ?? []), ...closers]
     if (repairedEvents.length > 0) await this.appendLines(meta, repairedEvents)

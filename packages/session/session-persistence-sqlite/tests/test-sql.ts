@@ -19,6 +19,8 @@ export type TestSqlName =
   | 'select-page-size'
   | 'select-event-rowids'
   | 'select-event-rows'
+  | 'select-session-columns'
+  | 'select-session-epoch'
   | 'select-user-version'
   | 'set-application-id-12345'
   | 'set-page-size-4096'
@@ -27,6 +29,7 @@ export type TestSqlName =
   | 'set-user-version-17'
   | 'set-user-version-18'
   | 'set-user-version-19'
+  | 'set-user-version-20'
   | 'update-invalid-session-metadata'
   | 'vacuum'
 

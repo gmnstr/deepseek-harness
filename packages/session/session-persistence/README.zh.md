@@ -45,6 +45,10 @@ const headers = await ctx.sessionPersistence.list()        // every stored sessi
 
 `append` 只在批次持久后返回，因此成功返回的写入在操作系统崩溃或断电后依然存在。普通 `create` 保持惰性；只有当空会话本身必须出现在持久列表中时，生命周期前端才调用 `ensureMaterialized`，且不会虚构事件。`load` 返回不可变的平衡日志并提交任何需要的崩溃恢复；`inspect` 读取同一视图但不提交恢复。从水位恢复的消费方可以只读取该序列号及之后的已存储事件，会话的产物位置（`locate`）不经文件系统 I/O 即可解析。
 
+### 受隔离的追加与所有权纪元
+
+多进程写入方绝不能把陈旧进程的事件追加到另一个进程已接管的会话。每个后端通过 `ownershipSupport` 声明其现实：`FENCING_SUPPORTED`（SQLite）、`UNSUPPORTED_FAIL_CLOSED`（JSONL——受隔离形式会被拒绝，绝不静默丢弃）或 `NOT_PRODUCTION_CAPABLE_FOR_MULTI_WRITER`。支持隔离的后端暴露 `appendFenced(id, events, { worker_id, ownership_epoch })`，它与 `append` 执行相同的验证与序列化，并把持久化纪元传入后端的追加事务，因此陈旧纪元会在任何事件提交前被拒绝。所有权通过后端的纪元 CAS 迁移；不受隔离的 `append` 继续供遗留与修复路径使用。
+
 ### 恢复与崩溃恢复
 
 恢复就是 `load` 加会话准备：存储日志连同其头部血缘一起返回，因此恢复后的 agent（智能体）看到相同的历史与组装。中途崩溃的会话重新加载时，其被中断的最终轮次会保留并保持平衡：`load` 为未获回答的调用追加合成 `tool/result` 与 `turn/end {interrupted}` closer，而不是丢弃事件——单个轮次可能很大，而这些事件在崩溃前已持久写入。只有从未完整写入的撕裂尾部碎片会被丢弃。
@@ -73,6 +77,7 @@ const headers = await ctx.sessionPersistence.list()        // every stored sessi
 - **连续 `seq`。** 日志中间的缺口会被拒绝；`append` 的第一个 `seq` 必须等于已存储 next-seq。
 - **无损 JSON 数据。** 批次经过共享单遍无损 JSON 边界；无法序列化的载荷在 append 处被拒绝。
 - **持久性。** `append` 只在批次持久后返回。
+- **隔离是被声明的，而非假设。** 无法隔离的后端会让受隔离的追加形式失败关闭，而不是假装纪元已被遵守。
 
 ### 源码地图
 

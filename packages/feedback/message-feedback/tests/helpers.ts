@@ -110,6 +110,7 @@ export function messageFixture(
 /** Minimal controllable persistence provider for service-level tests. */
 class TestPersistence extends SessionPersistence {
   override readonly supportsRawArtifacts = false
+  override readonly ownershipSupport: SessionPersistence['ownershipSupport'] = 'UNSUPPORTED_FAIL_CLOSED'
 
   static inject = ['sessions']
 

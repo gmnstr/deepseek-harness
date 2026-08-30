@@ -23,11 +23,13 @@ import {
   type SessionInspection,
   type SessionLocation,
   type SessionPersistenceSnapshot,
+  type WriterEpochToken,
 } from '@deepseek-ai/dsh-session-persistence'
 import type { JournalMode } from './schema.ts'
 import { SqliteStore } from './store.ts'
 
 export { SCHEMA_VERSION } from './schema.ts'
+export { SessionOwnershipFencedError, SqliteStore } from './store.ts'
 
 /** Default wait for another SQLite connection's write reservation. */
 export const DEFAULT_BUSY_TIMEOUT_MS = 5_000
@@ -53,6 +55,7 @@ export interface Config {
  */
 export class SqliteSessionPersistence extends SessionPersistence {
   override readonly supportsRawArtifacts = false
+  override readonly ownershipSupport: SessionPersistence['ownershipSupport'] = 'FENCING_SUPPORTED'
   override readonly name = 'session-persistence-sqlite'
 
   static inject = ['sessions']
@@ -106,6 +109,14 @@ export class SqliteSessionPersistence extends SessionPersistence {
 
   append(id: SessionId, events: readonly SessionEvent[]): Promise<void> {
     return this.coordinator.append(id, events)
+  }
+
+  override appendFenced(
+    id: SessionId,
+    events: readonly SessionEvent[],
+    writer: WriterEpochToken,
+  ): Promise<void> {
+    return this.coordinator.appendFenced(id, events, writer)
   }
 
   override prepare(id: SessionId, signal?: AbortSignal): Promise<SessionPreparation> {

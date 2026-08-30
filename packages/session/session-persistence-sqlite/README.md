@@ -33,7 +33,7 @@ Choose this backend when a local deployment benefits from one queryable database
 
 ### Disk footprint and performance
 
-The packed layout exchanges some SQLite-local latency for a smaller queryable database. On the 501-session comparison corpus, the schema-19 layout used 233.18 MB against the SQLite comparison baseline's 438.31 MB and compressed JSONL's 148.15 MB. Full writes were about 2.3× faster than JSONL and suffix reads remained much faster; complete reads and forks were slightly slower than JSONL. The [persistence latency and page-size decision](../../../.agents/notes/implemented/architecture/2026-08-25-persistence-latency-and-page-size.md) owns the method, complete metrics, and accepted trade-offs.
+The packed layout exchanges some SQLite-local latency for a smaller queryable database. On the 501-session comparison corpus, the schema-19 layout used 233.18 MB against the SQLite comparison baseline's 438.31 MB and compressed JSONL's 148.15 MB. Full writes were about 2.3× faster than JSONL and suffix reads remained much faster; complete reads and forks were slightly slower than JSONL. The [persistence latency and page-size decision](../../../.agents/notes/implemented/architecture/2026-08-25-persistence-latency-and-page-size.md) owns the method, complete metrics, and accepted trade-offs. Schema 20 keeps that packed layout and adds the per-session `ownership_epoch` column that powers durable stale-writer fencing.
 
 The disk cost buys a structured, queryable view of session history: external tooling can analyze `sessions` and `events` with SQL, decoding physical rows the way this provider does — the groundwork for features such as built-in full-text search.
 
@@ -75,7 +75,7 @@ await ctx.sessionPersistence.append(id, events)
 
 ### Startup and safe operation
 
-A fresh database initializes directly at schema version 19 with 64 KiB pages. Existing files are never retuned: databases with any other version, a foreign application identity, an unversioned non-pristine schema, or unexpected schema objects are rejected before any data is exposed or changed. This pre-release provider ships no migration. Every statement and fixed pragma comes from packaged `.sql` resources in `resources/sql/`, and runtime values are bound as SQLite parameters, so package code never assembles query text.
+A fresh database initializes directly at schema version 20 with 64 KiB pages. Existing files are never retuned: databases with any other version, a foreign application identity, an unversioned non-pristine schema, or unexpected schema objects are rejected before any data is exposed or changed. This pre-release provider ships no migration. Every statement and fixed pragma comes from packaged `.sql` resources in `resources/sql/`, and runtime values are bound as SQLite parameters, so package code never assembles query text.
 
 Each connection disables SQLite trusted schemas and memory-mapped I/O, verifies the requested journal mode, and pins `synchronous=FULL` so a resolved append remains durable across an OS crash or power loss. On POSIX, the database parent directory and file must belong to the current user, the parent must not be group/world-writable, and the file must grant no group or world permissions; Windows additionally rejects symbolic links and non-regular files, while ACL restriction stays the deployment's job. Path and ownership failures reject plugin initialization; Node's SQLite driver loads lazily on the first persistence operation. Ordinary `create` stays lazy until the first append, while `ensureMaterialized` writes a session metadata row with no event rows.
 
@@ -94,9 +94,10 @@ This section explains the design decisions behind the provider and points at the
 The provider is built on one separation and three commitments:
 
 - **Logical contract, physical format.** Callers always read and write ordinary `SessionEvent[]`; how rows are packed, stored, and compressed is private to this package.
-- **The schema owns the format.** Schema 19 is a frozen physical contract: a database at another version, with a foreign identity, or with unexpected schema objects is rejected, never migrated. Changing the schema, row codec, page size, or dictionary bytes requires a new schema version.
+- **The schema owns the format.** Schema 20 is a frozen physical contract: a database at another version, with a foreign identity, or with unexpected schema objects is rejected, never migrated. Changing the schema, row codec, page size, or dictionary bytes requires a new schema version.
 - **Durability is the default.** Appends run in immediate transactions with `synchronous=FULL`, and a resolved `append()` means the batch is durable. Normal appends are insert-only: earlier event rows are never rewritten.
 - **Efficiency within strict bounds.** Packing and compression keep the database small, but every limit is a hard format bound — at most 1,024 events and 1 MiB of payload per packed row.
+- **Stale writers are fenced, not filtered.** A fenced append carries a durable ownership epoch; the store verifies it inside the immediate transaction and rejects a stale writer before any event row commits. The epoch survives across processes because it lives in the `sessions` table, and ownership migrates only through an atomic compare-and-swap.
 
 The packed-row foundation lives in the [SQLite physical chunk-row decision](../../../.agents/notes/implemented/architecture/2026-08-18-sqlite-physical-chunk-row-compression.md); the current compression, key, and page-size choices live in the [persistence latency and page-size decision](../../../.agents/notes/implemented/architecture/2026-08-25-persistence-latency-and-page-size.md).
 
@@ -119,14 +120,14 @@ A fresh database contains three strict tables, defined in [`resources/sql/schema
 | Table | Purpose |
 |---|---|
 | `persistence_state` | One-row store identity |
-| `sessions` | One row per session: header fields plus a monotonic revision |
+| `sessions` | One row per session: header fields, a monotonic revision, and the durable ownership epoch |
 | `events` | Physical event rows: one logical event, or one packed run |
 
 The exact columns live in [`resources/sql/schema.sql`](resources/sql/schema.sql). `sessions.id` is an internal integer key while `sessions.session_key` retains the public session id. `events.data` holds text or an independently decodable Zstandard blob; compression uses the schema-owned shared dictionary only when the result is smaller. `events.source_event_seqs` uses tagged delta or run encoding. `events.is_packed` is `0` for a scalar logical event and `1` for a packed chunk run, so a scalar event whose type matches a physical chunk tag remains unambiguous. Packed rows reuse the `seq` of their first logical event, so under the composite `(session_id, seq)` primary key physical order is logical order.
 
-### Write path
+### Write path and stale-writer fencing
 
-Each append takes an immediate transaction, re-validates schema ownership, checks the stored tail so a stale writer cannot extend the log, packs only the new batch, inserts its rows, bumps the session revision once, and commits. The coordinator coalesces live events for the configured window, so high-frequency streams produce larger packed runs while physical writes stay proportional to newly durable batches.
+Each append takes an immediate transaction, re-validates schema ownership, checks the stored tail so a stale writer cannot extend the log, packs only the new batch, inserts its rows, bumps the session revision once, and commits. A fenced append additionally verifies `sessions.ownership_epoch === writerEpoch` inside the same transaction and throws `SessionOwnershipFencedError` before any event row commits when a stale writer holds an old epoch. Ownership migrates only through `advanceOwnershipEpoch(id, from, to)`, which runs `UPDATE sessions SET ownership_epoch = ? WHERE session_key = ? AND ownership_epoch = ?` atomically and reports whether exactly one row changed — so two processes racing to claim a session cannot both win. The epoch is set to `0` on a fresh insert and is never reset by the upsert conflict path, so an existing session's ownership survives re-materialization and backend restarts. The coordinator coalesces live events for the configured window, so high-frequency streams produce larger packed runs while physical writes stay proportional to newly durable batches.
 
 ### Read and recovery
 
@@ -173,7 +174,8 @@ Physical packing does not mutate request prefixes. Provider cache reuse depends 
 
 These limits define when the provider is a poor fit or needs special operational care. They are current package constraints, not a general SQLite comparison or a task backlog.
 
-- **Pre-release design with no migration** — schema 19 is an interim SQLite-only design; neither schema stability nor migration support is guaranteed.
+- **Pre-release design with no migration** — schema 20 is an interim SQLite-only design; neither schema stability nor migration support is guaranteed.
+- **Fencing requires the coordinator to pass the epoch** — `append` (the legacy surface) and live write-behind drains stay unfenced; only `appendFenced` carries the durable epoch into the store. A deployment mixing fenced and unfenced writers keeps the unfenced side's protection at the contiguity check, not the fence.
 - **Packing depends on batch boundaries** — a compatible run split by the write-behind window or an explicit flush stays split across physical rows; this avoids rewriting prior rows at the cost of a timing-dependent packing ratio.
 - **Synchronous SQLite and compression** — Node's SQLite driver and Zstandard calls block the JavaScript thread.
 - **Busy waits block the event loop** — SQLite waits inside synchronous calls; a competing writer can stall the thread for up to the configured `busyTimeoutMs`.

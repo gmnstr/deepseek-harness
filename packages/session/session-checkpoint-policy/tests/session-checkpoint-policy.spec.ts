@@ -14,6 +14,7 @@ const contexts: Context[] = []
 
 class TestPersistence extends SessionPersistence {
   override readonly supportsRawArtifacts = false
+  override readonly ownershipSupport: SessionPersistence['ownershipSupport'] = 'UNSUPPORTED_FAIL_CLOSED'
 
   locate(_meta: SessionHeader): undefined { return undefined }
   create(_meta: SessionHeader): Promise<void> { return Promise.resolve() }

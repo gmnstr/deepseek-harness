@@ -148,6 +148,7 @@ JSONL 存储不修改实时请求前缀。只有重建历史、当前 envelope �
 - **压缩文件不能直接按行读取**——使用后端加载；或在写入新根前选择 `compression: 'none'`，供外部行读取方使用。
 - **不删除会话文件**——日志在 `root` 下累积，直到外部移除；seam 无删除接口。
 - **每会话一个活动写入方**——append 与修复只在所属后端实例内协调；在该所有者达到完全停稳的 dispose 前，另一实例或进程不得写入同一会话。
+- **无陈旧写入方隔离**——后端声明 `ownershipSupport: 'UNSUPPORTED_FAIL_CLOSED'`：受隔离的追加（`appendFenced`）会被拒绝，而不是静默丢弃所有权纪元，因为文件布局没有持久化纪元原语。
 - **POSIX 实体化需要硬链接支持**——第一次 append 使用 `link()`，使同 id 竞态失败而不覆盖已提交日志；Windows 使用无替换 write-through rename。
 
 <a id="dev-note"></a>

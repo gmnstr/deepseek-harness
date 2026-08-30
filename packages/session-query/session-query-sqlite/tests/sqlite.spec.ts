@@ -68,6 +68,7 @@ function replaceCursorOffset(
 
 class TestPersistence extends SessionPersistence {
   override readonly supportsRawArtifacts = false
+  override readonly ownershipSupport: SessionPersistence['ownershipSupport'] = 'UNSUPPORTED_FAIL_CLOSED'
 
   static entries = new Map<SessionIdType, { meta: SessionHeader; events: SessionEvent[] }>()
   static revisions = new Map<SessionIdType, number>()
