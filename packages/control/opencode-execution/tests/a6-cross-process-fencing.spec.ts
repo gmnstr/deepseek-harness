@@ -189,7 +189,12 @@ describe('A6 cross-process fencing (real durable backend)', () => {
       runOwnerChild(path, String(sessionId), 'append', '0'),
     ])
     for (const result of [a, b]) {
-      expect(['APPENDED', 'SEQ_CONFLICT'].includes(result.RESULT ?? '')).toBe(true)
+      // The fixture prints RESULT=SEQ_CONFLICT:<message>; match the prefix the
+      // same way the FENCED checks do. A same-epoch concurrent append can
+      // never be FENCED (the epoch matches), so a FENCED prefix here would be
+      // an unexpected defect; an ERROR prefix fails via the child exit code.
+      const classified = result.RESULT ?? ''
+      expect(classified === 'APPENDED' || classified.startsWith('SEQ_CONFLICT'), `concurrent-append result was ${JSON.stringify(result)}`).toBe(true)
     }
     const winners = (a.RESULT === 'APPENDED' ? 1 : 0) + (b.RESULT === 'APPENDED' ? 1 : 0)
     expect(winners).toBeGreaterThanOrEqual(1)
